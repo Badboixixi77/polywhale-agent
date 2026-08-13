@@ -110,3 +110,42 @@ def test_drawdown_below_threshold_survives(env):
     risk.watchdog_tick(20.0)
     status = risk.watchdog_tick(17.0)        # -15%, above the 20% kill level
     assert not status["killed"]
+
+
+# ---- watchdog: weekly profit lock ----
+def test_weekly_profit_lock_engages_at_target(env):
+    _, ledger, risk = env                    # default lock = $100
+    risk.watchdog_tick(50.0)                 # anchors week start at $50
+    status = risk.watchdog_tick(150.0)       # +$100 for the week
+    assert status["weekly_halted"]
+    assert status["weekly_pnl"] >= 100.0
+    ok, reason = risk.approve_entry("meme", 2.0)
+    assert not ok and "weekly profit lock" in reason
+    ok, reason = risk.approve_entry("satellite", 5.0)
+    assert not ok and "weekly profit lock" in reason
+
+
+def test_weekly_profit_below_target_keeps_trading(env):
+    _, _, risk = env
+    risk.watchdog_tick(50.0)
+    status = risk.watchdog_tick(120.0)       # +$70: under the $100 lock
+    assert not status["weekly_halted"]
+
+
+def test_weekly_lock_disabled_at_zero(env):
+    _, ledger, risk = env
+    cfg2 = make_cfg(weekly_profit_lock_usd=0.0)
+    risk2 = RiskEngine(cfg2, ledger)
+    risk2.watchdog_tick(50.0)
+    status = risk2.watchdog_tick(500.0)      # huge gain, but lock disabled
+    assert not status["weekly_halted"]
+
+
+def test_week_anchor_rolls_over(env):
+    _, ledger, risk = env
+    risk.watchdog_tick(100.0)
+    ledger.set_meta("week_key", "1999-W01")  # simulate week rollover
+    ledger.set_meta("week_start_equity", 999.0)
+    status = risk.watchdog_tick(100.0)
+    assert status["weekly_pnl"] == 0.0       # re-anchored at current equity
+    assert ledger.get_meta("week_key") != "1999-W01"

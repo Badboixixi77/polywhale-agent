@@ -3,7 +3,7 @@ reaches execution, and the watchdog enforces portfolio-level stops.
 """
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("PolyWhale.risk")
 
@@ -26,6 +26,11 @@ class RiskEngine:
         until = self.ledger.get_meta("daily_halt_until", "0")
         return time.time() < float(until)
 
+    # ---- weekly profit lock ----
+    def weekly_halt_active(self) -> bool:
+        until = self.ledger.get_meta("weekly_halt_until", "0")
+        return time.time() < float(until)
+
     # ---- manual halt (operator command) ----
     def manual_halt_active(self) -> bool:
         return self.ledger.get_meta("manual_halt", "0") == "1"
@@ -41,6 +46,8 @@ class RiskEngine:
             return False, "kill switch active"
         if self.daily_halt_active():
             return False, "daily loss halt active"
+        if self.weekly_halt_active():
+            return False, "weekly profit lock active"
         if self.manual_halt_active():
             return False, "manual halt active"
         if usd <= 0:
@@ -78,12 +85,21 @@ class RiskEngine:
 
     # ---- portfolio watchdog ----
     def watchdog_tick(self, equity: float) -> dict:
-        """Called every cycle. Rolls the day anchor, enforces daily loss and drawdown."""
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        """Called every cycle. Rolls the day/week anchors, enforces daily loss,
+        weekly profit lock, and drawdown."""
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
         if self.ledger.get_meta("day_key") != today:
             self.ledger.set_meta("day_key", today)
             self.ledger.set_meta("day_start_equity", equity)
             logger.info(f"Watchdog: new day {today}, start equity ${equity:.2f}")
+
+        iso = now.isocalendar()
+        week_key = f"{iso.year}-W{iso.week:02d}"
+        if self.ledger.get_meta("week_key") != week_key:
+            self.ledger.set_meta("week_key", week_key)
+            self.ledger.set_meta("week_start_equity", equity)
+            logger.info(f"Watchdog: new week {week_key}, start equity ${equity:.2f}")
 
         peak = float(self.ledger.get_meta("peak_equity", "0") or 0)
         if equity > peak:
@@ -98,6 +114,19 @@ class RiskEngine:
             self.ledger.set_meta("daily_halt_until", time.time() + 24 * 3600)
             logger.warning(f"WATCHDOG: daily loss ${daily_pnl:.2f} breached -${daily_limit:.2f}, halting entries 24h")
 
+        week_start = float(self.ledger.get_meta("week_start_equity", equity) or equity)
+        weekly_pnl = equity - week_start
+        lock_usd = self.cfg.weekly_profit_lock_usd
+        if lock_usd > 0 and not self.weekly_halt_active() and weekly_pnl >= lock_usd:
+            days_ahead = 8 - now.isoweekday()  # next Monday 00:00 UTC
+            until = (now + timedelta(days=days_ahead)).replace(
+                hour=0, minute=0, second=0, microsecond=0).timestamp()
+            self.ledger.set_meta("weekly_halt_until", until)
+            logger.warning(
+                f"WATCHDOG: weekly profit ${weekly_pnl:+.2f} reached lock level "
+                f"${lock_usd:.2f} — entries paused until Monday UTC"
+            )
+
         drawdown = (peak - equity) / peak if peak > 0 else 0.0
         if not self.kill_switch_active() and drawdown >= self.cfg.drawdown_kill_pct:
             self.ledger.set_meta("kill_switch", "1")
@@ -109,8 +138,10 @@ class RiskEngine:
         return {
             "equity": equity,
             "daily_pnl": daily_pnl,
+            "weekly_pnl": weekly_pnl,
             "peak_equity": peak,
             "drawdown": drawdown,
             "halted": self.daily_halt_active(),
+            "weekly_halted": self.weekly_halt_active(),
             "killed": self.kill_switch_active(),
         }

@@ -50,6 +50,7 @@ class PolyWhaleAgent:
         self.cycle = 0
         self._last_day = None
         self._was_halted = False
+        self._was_week_locked = False
         self._was_killed = False
         self._last_status = None
 
@@ -230,11 +231,13 @@ class PolyWhaleAgent:
 
     def ops_status(self) -> str:
         s = self._status()
-        flags = (" HALTED" if s["halted"] else "") + (" KILLED" if s["killed"] else "")
+        flags = ((" HALTED" if s["halted"] else "") + (" KILLED" if s["killed"] else "")
+                 + (" WEEK-LOCKED" if s.get("weekly_halted") else ""))
         halt = "ENGAGED" if self.risk.manual_halt_active() else "off"
         lines = [
             f"PolyWhale status | mode={'PAPER' if self.cfg.dry_run else 'LIVE'}{flags}",
-            f"Equity: ${s['equity']:.2f} | Day PnL: ${s['daily_pnl']:+.2f} | Drawdown: {s['drawdown']:.1%}",
+            f"Equity: ${s['equity']:.2f} | Day PnL: ${s['daily_pnl']:+.2f} | "
+            f"Week PnL: ${s.get('weekly_pnl', 0.0):+.2f} | Drawdown: {s['drawdown']:.1%}",
             f"Manual halt: {halt}",
         ]
         positions = self.ledger.open_positions()
@@ -283,9 +286,15 @@ class PolyWhaleAgent:
             self._last_day = today
         if status["halted"] and not self._was_halted:
             await self.notifier.send("WATCHDOG: daily loss limit hit — new entries halted for 24h")
+        if status.get("weekly_halted") and not self._was_week_locked:
+            await self.notifier.send(
+                f"WEEKLY PROFIT LOCK: ${status['weekly_pnl']:+.2f} banked this week — "
+                f"new entries paused until Monday UTC. Exits still managed."
+            )
         if status["killed"] and not self._was_killed:
             await self.notifier.send("WATCHDOG: KILL SWITCH ENGAGED — trading stopped, manual reset required")
         self._was_halted, self._was_killed = status["halted"], status["killed"]
+        self._was_week_locked = status.get("weekly_halted", False)
 
     # ---- main loop ----
     async def run(self):
@@ -339,11 +348,12 @@ class PolyWhaleAgent:
                     self.metrics.write_dashboard()
                 await self._watch_events(status)
                 n_open = len(self.ledger.open_positions())
-                flags = (" HALTED" if status["halted"] else "") + (" KILLED" if status["killed"] else "")
+                flags = ((" HALTED" if status["halted"] else "") + (" KILLED" if status["killed"] else "")
+                         + (" WEEK-LOCKED" if status.get("weekly_halted") else ""))
                 logger.info(
                     f"Cycle {self.cycle}: SOL=${sol_price:.2f} equity=${status['equity']:.2f} "
-                    f"dayPnL=${status['daily_pnl']:+.3f} dd={status['drawdown']:.1%} "
-                    f"open={n_open}{flags}"
+                    f"dayPnL=${status['daily_pnl']:+.3f} weekPnL=${status['weekly_pnl']:+.3f} "
+                    f"dd={status['drawdown']:.1%} open={n_open}{flags}"
                 )
                 if status["killed"]:
                     logger.critical("Kill switch engaged — idling. Reset manually to resume.")

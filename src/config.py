@@ -48,6 +48,7 @@ class Config:
     drawdown_kill_pct: float
     slippage_bps: int
     max_priority_fee_lamports: int
+    weekly_profit_lock_usd: float = 100.0  # 0 disables; >0 banks gains weekly
     # alerts (optional — log-only when empty)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -87,6 +88,7 @@ class Config:
             drawdown_kill_pct=float(os.getenv("DRAWDOWN_KILL_PCT", "0.20")),
             slippage_bps=int(os.getenv("SLIPPAGE_BPS", "100")),
             max_priority_fee_lamports=int(os.getenv("MAX_PRIORITY_FEE_LAMPORTS", "100000")),
+            weekly_profit_lock_usd=float(os.getenv("WEEKLY_PROFIT_LOCK_USD", "100")),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
             discovery=os.getenv("DISCOVERY", "market").lower(),
