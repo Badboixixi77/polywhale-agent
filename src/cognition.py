@@ -163,3 +163,36 @@ class MemeEngine:
         if ret >= self.cfg.take_profit_pct and not pos.get("tp_half_done"):
             return 0.5, f"take_profit_half ({ret:+.0%})"
         return None
+
+    # ---- satellite sleeve (aggression mode) ----
+    def satellite_gate(self, c: CandidateToken, now: float = None) -> tuple:
+        """Deliberately loose: fresh momentum is the point. Only hard floors —
+        tradable liquidity, not literally seconds old, not a blow-off top,
+        not a falling knife."""
+        if c.liquidity_usd < self.cfg.satellite_min_liquidity_usd:
+            return False, f"liquidity ${c.liquidity_usd:.0f} < ${self.cfg.satellite_min_liquidity_usd:.0f}"
+        if c.age_hours(now) < 1.0:
+            return False, f"age {c.age_hours(now):.2f}h < 1h"
+        if c.price_change_h6 > self.MAX_PUMP_H6:
+            return False, f"blow-off top risk: +{c.price_change_h6:.0f}% in 6h"
+        if c.price_change_h1 < self.MAX_DUMP_H1:
+            return False, f"falling knife: {c.price_change_h1:.0f}% in 1h"
+        if c.price_usd <= 0:
+            return False, "no price"
+        return True, "satellite_gate_ok"
+
+    def satellite_exit(self, pos: dict, now: float = None) -> Optional[tuple]:
+        """Ride winners: no take-profit, no time limit. Wide stop while
+        underwater; a trailing stop locks gains once the slice is in profit."""
+        now = now if now is not None else time.time()
+        entry, current = pos["entry_price"], pos["current_price"]
+        if entry <= 0 or current <= 0:
+            return None
+        ret = current / entry - 1.0
+        peak = max(pos.get("peak_price", 0), current)
+
+        if ret <= self.cfg.satellite_stop_pct:
+            return 1.0, f"satellite_stop ({ret:+.0%})"
+        if peak > entry and current <= peak * (1.0 - self.cfg.satellite_trail_pct):
+            return 1.0, f"satellite_trail (peak ${peak:.8g})"
+        return None

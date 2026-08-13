@@ -56,6 +56,12 @@ class Config:
     min_market_liquidity_usd: float = 25000.0
     min_market_age_hours: float = 48.0
     meme_scan_every_cycles: int = 3
+    # satellite sleeve: one high-momentum coin, full compounding, wide leash
+    satellite_enabled: bool = True
+    satellite_budget_usd: float = 5.0
+    satellite_trail_pct: float = 0.25     # trail from peak once in profit
+    satellite_stop_pct: float = -0.60     # wide stop; the slice is the risk unit
+    satellite_min_liquidity_usd: float = 10000.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -87,4 +93,9 @@ class Config:
             min_market_liquidity_usd=float(os.getenv("MIN_MARKET_LIQUIDITY_USD", "25000")),
             min_market_age_hours=float(os.getenv("MIN_MARKET_AGE_HOURS", "48")),
             meme_scan_every_cycles=int(os.getenv("MEME_SCAN_EVERY_CYCLES", "3")),
+            satellite_enabled=os.getenv("SATELLITE_ENABLED", "true").lower() == "true",
+            satellite_budget_usd=float(os.getenv("SATELLITE_BUDGET_USD", "5")),
+            satellite_trail_pct=float(os.getenv("SATELLITE_TRAIL_PCT", "0.25")),
+            satellite_stop_pct=float(os.getenv("SATELLITE_STOP_PCT", "-0.60")),
+            satellite_min_liquidity_usd=float(os.getenv("SATELLITE_MIN_LIQUIDITY_USD", "10000")),
         )

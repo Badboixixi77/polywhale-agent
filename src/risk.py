@@ -60,6 +60,15 @@ class RiskEngine:
                 return False, f"majors sleeve budget ${self.cfg.majors_budget:.2f} exhausted"
             return True, "approved"
 
+        if sleeve == "satellite":
+            # One coin at a time; the slice (compounded capital) is the risk unit.
+            if self.ledger.position_count("satellite") >= 1:
+                return False, "satellite already holds a position"
+            capital = float(self.ledger.get_meta("satellite_capital", self.cfg.satellite_budget_usd))
+            if usd > capital + 1e-9:
+                return False, f"${usd:.2f} exceeds satellite capital ${capital:.2f}"
+            return True, "approved"
+
         return False, f"unknown sleeve: {sleeve}"
 
     def approve_slippage(self, bps: float) -> tuple:

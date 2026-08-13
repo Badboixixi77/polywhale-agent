@@ -72,23 +72,16 @@ class PolyWhaleAgent:
     async def manage_exits(self):
         sol_price = await self.perception.sol_price()
         for pos in self.ledger.open_positions():
-            if pos["sleeve"] != "meme":
+            if pos["sleeve"] not in ("meme", "satellite"):
                 continue
-            price = await self.perception.token_price(pos["mint"])
+            price = await self._guarded_price(pos)
             if price <= 0:
                 continue
-            # Bad-data guard: cross-check a wild jump against a second source.
-            if pos["current_price"] > 0 and (price / pos["current_price"] > PRICE_JUMP_LIMIT
-                                              or price / pos["current_price"] < 1 / PRICE_JUMP_LIMIT):
-                cross = await self.perception.token_price_dexscreener(pos["mint"])
-                if cross <= 0 or (cross / pos["current_price"] > PRICE_JUMP_LIMIT
-                                  or cross / pos["current_price"] < 1 / PRICE_JUMP_LIMIT):
-                    logger.warning(f"price guard: {pos['symbol']} mark rejected "
-                                   f"(${pos['current_price']:.8g} -> ${price:.8g})")
-                    continue
-                price = cross
             self.ledger.update_price(pos["mint"], price)
             pos["current_price"] = price
+            if pos["sleeve"] == "satellite":
+                await self._satellite_exit_check(pos, sol_price)
+                continue
             decision = self.memes.exit_decision(pos)
             if decision is None:
                 continue
@@ -102,6 +95,37 @@ class PolyWhaleAgent:
                 self.ledger.mark_tp_half_done(pos["id"])
             logger.info(f"EXIT {pos['symbol']} [{reason}] fraction={fraction:.0%} pnl=${pnl:+.3f}")
             await self.notifier.send(f"EXIT {pos['symbol']} [{reason}] pnl ${pnl:+.2f}")
+
+    async def _guarded_price(self, pos: dict) -> float:
+        """Fresh mark for a position, rejected if it jumps wildly without a
+        second source agreeing (bad-data guard)."""
+        price = await self.perception.token_price(pos["mint"])
+        if price <= 0 or pos["current_price"] <= 0:
+            return price
+        if price / pos["current_price"] > PRICE_JUMP_LIMIT or price / pos["current_price"] < 1 / PRICE_JUMP_LIMIT:
+            cross = await self.perception.token_price_dexscreener(pos["mint"])
+            if cross <= 0 or (cross / pos["current_price"] > PRICE_JUMP_LIMIT
+                              or cross / pos["current_price"] < 1 / PRICE_JUMP_LIMIT):
+                logger.warning(f"price guard: {pos['symbol']} mark rejected "
+                               f"(${pos['current_price']:.8g} -> ${price:.8g})")
+                return 0.0
+            price = cross
+        return price
+
+    async def _satellite_exit_check(self, pos: dict, sol_price: float):
+        decision = self.memes.satellite_exit(pos)
+        if decision is None:
+            return
+        fraction, reason = decision
+        fill = await self.execution.sell("satellite", pos["mint"], pos["symbol"], pos["amount"] * fraction, sol_price)
+        if fill is None:
+            logger.warning(f"satellite exit deferred for {pos['symbol']}: swap failed")
+            return
+        pnl = self.ledger.reduce_position(pos["id"], fraction, fill["price"])
+        capital = max(fill["usd"], 0.0)  # full compounding: proceeds become the next slice
+        self.ledger.set_meta("satellite_capital", capital)
+        logger.info(f"SATELLITE EXIT {pos['symbol']} [{reason}] pnl=${pnl:+.3f} slice now ${capital:.2f}")
+        await self.notifier.send(f"SATELLITE EXIT {pos['symbol']} [{reason}] pnl ${pnl:+.2f} — slice now ${capital:.2f}")
 
     async def majors_tick(self, sol_price: float):
         last_dca_raw = self.ledger.get_meta("last_dca_ts")
@@ -129,6 +153,11 @@ class PolyWhaleAgent:
             candidates += await self.perception.discover_candidates(limit=15)
         if self.cfg.discovery in ("market", "both"):
             candidates += await self.perception.discover_market_candidates(limit=30)
+        entered = await self._meme_entry(candidates, held)
+        await self._satellite_entry(candidates, held | {entered} if entered else held)
+
+    async def _meme_entry(self, candidates: list, held: set):
+        """Disciplined sleeve: strict gates, fixed $2 size. Returns entered mint."""
         gated = []
         for c in candidates:
             ok, reason = self.memes.passes_gate(c)
@@ -146,7 +175,7 @@ class PolyWhaleAgent:
             approved, reason = self.risk.approve_entry("meme", self.cfg.meme_trade_cap_usd)
             if not approved:
                 logger.info(f"Meme entry blocked: {reason}")
-                return
+                return None
             fill = await self.execution.buy("meme", SOL_MINT, c.mint, c.symbol, self.cfg.meme_trade_cap_usd)
             if fill is None:
                 continue
@@ -154,7 +183,46 @@ class PolyWhaleAgent:
             tag = "MARKET" if c.source == "market" else "MEME"
             logger.info(f"{tag} entry: {c.symbol} score={self.memes.score(c):.2f}")
             await self.notifier.send(f"{tag} ENTRY: {c.symbol} ${self.cfg.meme_trade_cap_usd:.2f} (score {self.memes.score(c):.2f})")
-            return  # one new entry per scan keeps exposure growth slow
+            return c.mint  # one new entry per scan keeps exposure growth slow
+        return None
+
+    async def _satellite_entry(self, candidates: list, held: set):
+        """Aggression sleeve: one coin, whole slice, loose gate. The slice
+        compounds — wins roll fully into the next entry, losses shrink it."""
+        if not self.cfg.satellite_enabled or self.ledger.position_count("satellite") >= 1:
+            return
+        capital = float(self.ledger.get_meta("satellite_capital", self.cfg.satellite_budget_usd))
+        if capital < 0.50:
+            logger.info("satellite slice depleted — idling")
+            return
+        gated = []
+        for c in candidates:
+            ok, reason = self.memes.satellite_gate(c)
+            if ok and c.mint not in held:
+                gated.append(c)
+            elif not ok:
+                logger.debug(f"satellite gate reject {c.symbol}: {reason}")
+        if not gated:
+            return
+        gated.sort(key=self.memes.score, reverse=True)
+
+        for c in gated[:3]:
+            # risk-tolerant source keeps honeypot checks, drops meme paranoia
+            ok, reason = await self.memes.safety_check(self.perception.http, c.mint, "market")
+            if not ok:
+                logger.info(f"satellite safety reject {c.symbol}: {reason}")
+                continue
+            approved, reason = self.risk.approve_entry("satellite", capital)
+            if not approved:
+                logger.info(f"Satellite entry blocked: {reason}")
+                return
+            fill = await self.execution.buy("satellite", SOL_MINT, c.mint, c.symbol, capital)
+            if fill is None:
+                continue
+            self.ledger.open_or_add_position("satellite", c.mint, c.symbol, fill["usd"], fill["amount"], fill["price"])
+            logger.info(f"SATELLITE entry: {c.symbol} ${fill['usd']:.2f} score={self.memes.score(c):.2f}")
+            await self.notifier.send(f"SATELLITE ENTRY: {c.symbol} ${fill['usd']:.2f} (score {self.memes.score(c):.2f})")
+            return
 
     # ---- operator commands (Telegram) ----
     def _status(self) -> dict:
@@ -222,14 +290,18 @@ class PolyWhaleAgent:
     # ---- main loop ----
     async def run(self):
         logger.info(f"PolyWhale v2 activated | mode={self.execution.mode.upper()} | "
-                    f"bankroll=${self.cfg.bankroll:.0f} (majors ${self.cfg.majors_budget:.0f} / meme ${self.cfg.meme_budget:.0f})")
+                    f"bankroll=${self.cfg.bankroll:.0f} (majors ${self.cfg.majors_budget:.0f} / "
+                    f"meme ${self.cfg.meme_budget:.0f} / satellite ${self.cfg.satellite_budget_usd:.0f})")
         if not self.cfg.dry_run:
             logger.warning("LIVE MODE: real funds at risk. Kill switch resets manually only.")
         await self.notifier.send(
             f"PolyWhale v2 started | mode={'PAPER' if self.cfg.dry_run else 'LIVE'} | "
-            f"bankroll ${self.cfg.bankroll:.0f} (majors ${self.cfg.majors_budget:.0f} / meme ${self.cfg.meme_budget:.0f})"
+            f"bankroll ${self.cfg.bankroll:.0f} (majors ${self.cfg.majors_budget:.0f} / "
+            f"meme ${self.cfg.meme_budget:.0f} / satellite ${self.cfg.satellite_budget_usd:.0f})"
         )
         await self.bootstrap()
+        if self.cfg.satellite_enabled and self.ledger.get_meta("satellite_capital") is None:
+            self.ledger.set_meta("satellite_capital", self.cfg.satellite_budget_usd)
 
         if self.commands.enabled:
             asyncio.create_task(self.commands.run())
