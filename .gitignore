@@ -19,6 +19,8 @@ watchdog.err.log
 polywhale_ledger.db
 polywhale_ledger.db-wal
 polywhale_ledger.db-shm
+# ledger backups/archives from resets
+polywhale_ledger_*.db
 reports/
 
 # Editor / OS

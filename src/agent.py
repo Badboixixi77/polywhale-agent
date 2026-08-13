@@ -139,7 +139,7 @@ class PolyWhaleAgent:
         if not approved:
             logger.info(f"Majors DCA blocked: {reason}")
             return
-        fill = await self.execution.buy("majors", USDC_MINT, SOL_MINT, "SOL", decision.usd)
+        fill = await self.execution.buy("majors", SOL_MINT, SOL_MINT, "SOL", decision.usd)
         if fill is None:
             return
         self.ledger.open_or_add_position("majors", SOL_MINT, "SOL", fill["usd"], fill["amount"], fill["price"])

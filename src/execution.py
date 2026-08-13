@@ -61,6 +61,17 @@ class ExecutionLayer:
         self._decimals_cache[mint] = decimals
         return decimals
 
+    # ---- price ----
+    async def _sol_usd_price(self) -> float:
+        """Spot SOL price from Jupiter's price endpoint. 0.0 on any failure."""
+        try:
+            resp = await self.http.get(f"{JUPITER_BASE}/price/v3", params={"ids": SOL_MINT})
+            resp.raise_for_status()
+            return float(resp.json()[SOL_MINT]["usdPrice"])
+        except Exception as e:
+            logger.error(f"SOL price fetch failed: {e}")
+            return 0.0
+
     # ---- quote ----
     async def quote(self, input_mint: str, output_mint: str, amount_raw: int) -> dict:
         resp = await self.http.get(
@@ -84,6 +95,18 @@ class ExecutionLayer:
         try:
             in_dec = await self.get_decimals(input_mint)
             amount_raw = int(usd * (10 ** in_dec))
+            if input_mint == output_mint:
+                # no swap needed (e.g. majors DCA accumulating SOL from SOL):
+                # book the purchase directly at the current market price
+                price = await self._sol_usd_price() if output_mint == SOL_MINT else 0.0
+                if price <= 0:
+                    return None
+                out_amount = usd / price
+                mode = "paper" if self.cfg.dry_run else "live"
+                fill = {"mode": mode, "usd": usd, "amount": out_amount, "price": price}
+                self.ledger.record_fill(sleeve, output_mint, "buy", usd, out_amount, price, mode)
+                logger.info(f"[{mode}] BUY ${usd:.2f} {symbol}: {out_amount:.8g} @ ${price:.8g} (same-asset)")
+                return fill
             quote = await self.quote(input_mint, output_mint, amount_raw)
             out_dec = await self.get_decimals(output_mint)
             out_amount = int(quote["outAmount"]) / (10 ** out_dec)
