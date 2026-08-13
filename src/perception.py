@@ -4,16 +4,27 @@ Sources:
 - Jupiter Price API  -> live USD prices (SOL + any SPL mint)
 - CoinGecko          -> daily SOL history bootstrap for the trend filter
 - DexScreener        -> meme candidate discovery + pair stats
+- GeckoTerminal      -> whole-market discovery (top pools by volume)
 """
 import logging
 import time
+import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 
 import httpx
 
-from config import COINGECKO_BASE, DEXSCREENER_BASE, JUPITER_BASE, SOL_MINT
+from config import COINGECKO_BASE, DEXSCREENER_BASE, GECKOTERMINAL_BASE, JUPITER_BASE, SOL_MINT, USDC_MINT
 
 logger = logging.getLogger("PolyWhale.perception")
+
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+SKIP_MINTS = {SOL_MINT, USDC_MINT, USDT_MINT}  # never "hunt" SOL or stables as candidates
+# Stablecoins (any chain flavor) by symbol — momentum strategy can't work on pegs
+SKIP_SYMBOLS = {
+    "USDC", "USDT", "PYUSD", "USDE", "DAI", "USDS", "EURC", "USDG", "FDUSD",
+    "TUSD", "USDX", "USD1", "GHO", "CRVUSD", "FRAX", "LUSD", "MIM", "DOLA",
+}
 
 
 @dataclass
@@ -28,6 +39,7 @@ class CandidateToken:
     price_change_h6: float = 0.0
     price_change_h24: float = 0.0
     pair_address: str = ""
+    source: str = "meme"  # "meme" (DexScreener) or "market" (GeckoTerminal)
 
     def age_hours(self, now: float = None) -> float:
         if not self.pair_created_ms:
@@ -136,6 +148,76 @@ class PerceptionLayer:
             )
         except Exception as e:
             logger.warning(f"pair stats failed for {mint[:8]}: {e}")
+            return None
+
+    # ---- whole-market discovery ----
+    async def discover_market_candidates(self, limit: int = 30) -> list:
+        """Hunt the entire Solana market: top pools by 24h volume (GeckoTerminal).
+        Zero-liquidity pools (synthetic/prediction markets) are skipped as data
+        noise so the candidate budget is spent on tradable pools."""
+        candidates, seen = [], set()
+        for page in range(1, 9):
+            pools = None
+            for attempt in (1, 2):  # one retry after backoff if rate-limited
+                try:
+                    resp = await self.http.get(
+                        f"{GECKOTERMINAL_BASE}/networks/solana/pools",
+                        params={"page": page, "sort": "h24_volume_usd_desc"},
+                        headers={"Accept": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    pools = resp.json().get("data", [])
+                    break
+                except Exception as e:
+                    logger.warning(f"market discovery page {page} attempt {attempt} failed: {e}")
+                    if attempt == 1:
+                        await asyncio.sleep(5.0)  # back off, then retry once
+            if pools is None:
+                break  # rate-limited twice: deeper pages have worse volume anyway
+            for pool in pools:
+                c = self._pool_to_candidate(pool)
+                if c and c.mint not in seen and c.liquidity_usd >= 1000.0:
+                    seen.add(c.mint)
+                    candidates.append(c)
+            if len(candidates) >= limit:
+                break
+            await asyncio.sleep(2.0)  # pace GeckoTerminal's rate limit
+        return candidates[:limit]
+
+    def _pool_to_candidate(self, pool: dict):
+        """Parse one GeckoTerminal pool into a CandidateToken. None if unusable."""
+        try:
+            base_id = (pool.get("relationships", {}).get("base_token", {})
+                       .get("data", {}).get("id", ""))
+            mint = base_id.split("_", 1)[1] if "_" in base_id else ""
+            if not mint or mint in SKIP_MINTS:
+                return None
+            attrs = pool.get("attributes", {})
+            change = attrs.get("price_change_percentage", {}) or {}
+            volume = attrs.get("volume_usd", {}) or {}
+            created_ms = 0
+            if attrs.get("pool_created_at"):
+                created_ms = int(datetime.fromisoformat(
+                    attrs["pool_created_at"].replace("Z", "+00:00")).timestamp() * 1000)
+            name = attrs.get("name", "???")
+            symbol = name.split("/")[0].strip() if "/" in name else name
+            if symbol.upper() in SKIP_SYMBOLS:
+                return None
+            return CandidateToken(
+                mint=mint,
+                symbol=symbol,
+                price_usd=float(attrs.get("base_token_price_usd") or 0),
+                liquidity_usd=float(attrs.get("reserve_in_usd") or 0),
+                volume_h24=float(volume.get("h24") or 0),
+                pair_created_ms=created_ms,  # pool age stands in for token age
+                price_change_h1=float(change.get("h1") or 0),
+                price_change_h6=float(change.get("h6") or 0),
+                price_change_h24=float(change.get("h24") or 0),
+                pair_address=pool.get("id", ""),
+                source="market",
+            )
+        except Exception as e:
+            logger.warning(f"pool parse failed: {e}")
             return None
 
     async def close(self):

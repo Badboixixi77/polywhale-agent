@@ -17,6 +17,7 @@ JUPITER_BASE = "https://lite-api.jup.ag"
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 RUGCHECK_BASE = "https://api.rugcheck.xyz"
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+GECKOTERMINAL_BASE = "https://api.geckoterminal.com/api/v2"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,11 @@ class Config:
     # alerts (optional — log-only when empty)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    # discovery (meme | market | both) + whole-market gate tuning
+    discovery: str = "market"
+    min_market_liquidity_usd: float = 25000.0
+    min_market_age_hours: float = 48.0
+    meme_scan_every_cycles: int = 3
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -77,4 +83,8 @@ class Config:
             max_priority_fee_lamports=int(os.getenv("MAX_PRIORITY_FEE_LAMPORTS", "100000")),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            discovery=os.getenv("DISCOVERY", "market").lower(),
+            min_market_liquidity_usd=float(os.getenv("MIN_MARKET_LIQUIDITY_USD", "25000")),
+            min_market_age_hours=float(os.getenv("MIN_MARKET_AGE_HOURS", "48")),
+            meme_scan_every_cycles=int(os.getenv("MEME_SCAN_EVERY_CYCLES", "3")),
         )

@@ -63,11 +63,16 @@ class MemeEngine:
 
     # ---- entry ----
     def passes_gate(self, c: CandidateToken, now: float = None) -> tuple:
-        """Cheap statistical gate before we spend an API call on RugCheck."""
-        if c.liquidity_usd < self.cfg.min_token_liquidity_usd:
-            return False, f"liquidity ${c.liquidity_usd:.0f} < ${self.cfg.min_token_liquidity_usd:.0f}"
-        if c.age_hours(now) < self.cfg.min_token_age_hours:
-            return False, f"age {c.age_hours(now):.1f}h < {self.cfg.min_token_age_hours}h"
+        """Cheap statistical gate before we spend an API call on RugCheck.
+        Market-sourced candidates face market-tuned thresholds."""
+        if c.source == "market":
+            min_liq, min_age = self.cfg.min_market_liquidity_usd, self.cfg.min_market_age_hours
+        else:
+            min_liq, min_age = self.cfg.min_token_liquidity_usd, self.cfg.min_token_age_hours
+        if c.liquidity_usd < min_liq:
+            return False, f"liquidity ${c.liquidity_usd:.0f} < ${min_liq:.0f}"
+        if c.age_hours(now) < min_age:
+            return False, f"age {c.age_hours(now):.1f}h < {min_age:.0f}h"
         if c.price_change_h6 > self.MAX_PUMP_H6:
             return False, f"blow-off top risk: +{c.price_change_h6:.0f}% in 6h"
         if c.price_change_h1 < self.MAX_DUMP_H1:

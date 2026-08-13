@@ -29,7 +29,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PolyWhale")
 
-MEME_SCAN_EVERY = 5  # cycles
 DASHBOARD_EVERY = 15  # cycles (~15 min)
 RECONCILE_EVERY = 60  # cycles (~hourly on-chain balance check in live mode)
 PRICE_JUMP_LIMIT = 3.0  # reject price marks moving >3x per cycle (bad data guard)
@@ -125,7 +124,11 @@ class PolyWhaleAgent:
 
     async def meme_tick(self):
         held = {p["mint"] for p in self.ledger.open_positions()}
-        candidates = await self.perception.discover_candidates(limit=15)
+        candidates = []
+        if self.cfg.discovery in ("meme", "both"):
+            candidates += await self.perception.discover_candidates(limit=15)
+        if self.cfg.discovery in ("market", "both"):
+            candidates += await self.perception.discover_market_candidates(limit=30)
         gated = []
         for c in candidates:
             ok, reason = self.memes.passes_gate(c)
@@ -148,8 +151,9 @@ class PolyWhaleAgent:
             if fill is None:
                 continue
             self.ledger.open_or_add_position("meme", c.mint, c.symbol, fill["usd"], fill["amount"], fill["price"])
-            logger.info(f"Meme entry: {c.symbol} score={self.memes.score(c):.2f}")
-            await self.notifier.send(f"MEME ENTRY: {c.symbol} ${self.cfg.meme_trade_cap_usd:.2f} (score {self.memes.score(c):.2f})")
+            tag = "MARKET" if c.source == "market" else "MEME"
+            logger.info(f"{tag} entry: {c.symbol} score={self.memes.score(c):.2f}")
+            await self.notifier.send(f"{tag} ENTRY: {c.symbol} ${self.cfg.meme_trade_cap_usd:.2f} (score {self.memes.score(c):.2f})")
             return  # one new entry per scan keeps exposure growth slow
 
     # ---- operator commands (Telegram) ----
@@ -253,7 +257,7 @@ class PolyWhaleAgent:
 
                 await self.manage_exits()
                 await self.majors_tick(sol_price)
-                if self.cycle % MEME_SCAN_EVERY == 1:
+                if self.cycle % self.cfg.meme_scan_every_cycles == 1:
                     await self.meme_tick()
 
                 status = self.risk.watchdog_tick(self.equity())

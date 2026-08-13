@@ -18,7 +18,7 @@ Perception  ->  Cognition  ->  Risk  ->  Execution
 1. **Perception** (`src/perception.py`) — reads market data: SOL prices from the Jupiter API, trending tokens and liquidity stats from DexScreener, and long-term SOL price history from CoinGecko.
 2. **Cognition** (`src/cognition.py`) — two strategy engines decide *what* and *when*:
    - **MajorsEngine** — buys $2 of SOL once a week, but only while SOL trades above its 20-day average (a simple trend filter that pauses buying in downtrends).
-   - **MemeEngine** — scores trending tokens by momentum, then runs a strict safety screen (RugCheck report, liquidity, token age, holder concentration) before any entry.
+   - **MemeEngine** — scores candidates by momentum, then runs a strict safety screen (RugCheck report, liquidity, token age, holder concentration) before any entry. Candidates come from the configured hunt (`DISCOVERY` in `.env`): `market` scans the **entire Solana market** by volume via GeckoTerminal, `meme` scans DexScreener's boosted tokens, `both` merges the two.
 3. **Risk** (`src/risk.py`) — the cage. Every order must be approved here. It enforces per-trade caps, position limits, sleeve budgets, a daily-loss halt, and a portfolio drawdown kill switch.
 4. **Execution** (`src/execution.py`) — routes swaps through the Jupiter aggregator. In **paper mode** (default) it simulates fills from live quotes without touching your wallet; in live mode it signs and sends real transactions.
 
