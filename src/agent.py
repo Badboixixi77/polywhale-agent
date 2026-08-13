@@ -139,7 +139,7 @@ class PolyWhaleAgent:
         gated.sort(key=self.memes.score, reverse=True)
 
         for c in gated[:3]:
-            ok, reason = await self.memes.safety_check(self.perception.http, c.mint)
+            ok, reason = await self.memes.safety_check(self.perception.http, c.mint, c.source)
             if not ok:
                 logger.info(f"safety reject {c.symbol}: {reason}")
                 continue

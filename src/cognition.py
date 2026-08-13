@@ -87,33 +87,60 @@ class MemeEngine:
         momentum = 0.6 * c.price_change_h6 + 0.4 * c.price_change_h1
         return vol_liq * (1.0 + max(momentum, 0.0) / 100.0)
 
-    async def safety_check(self, http: httpx.AsyncClient, mint: str) -> tuple:
-        """On-chain safety report via RugCheck. Fails closed on any error."""
+    async def safety_check(self, http: httpx.AsyncClient, mint: str, source: str = "meme") -> tuple:
+        """On-chain safety report via RugCheck. Fails closed on any error.
+        Meme candidates face the full strict checklist; market candidates
+        (already filtered by liquidity/age/volume) keep the honeypot
+        vectors — live freeze authority and non-authority danger risks —
+        but tolerate CEX custody concentration and LP-lock reporting
+        quirks that established tokens legitimately have."""
         try:
             resp = await http.get(f"{RUGCHECK_BASE}/v1/tokens/{mint}/report")
             resp.raise_for_status()
             report = resp.json()
-            if report.get("mintAuthority"):
+            mint_live = self._authority_live(report.get("mintAuthority"))
+            freeze_live = self._authority_live(report.get("freezeAuthority"))
+            if source == "meme" and mint_live:
                 return False, "mint authority active"
-            if report.get("freezeAuthority"):
+            if freeze_live:
                 return False, "freeze authority active"
-            if report.get("score_normalised", 0) > 60:
+            if source == "meme" and report.get("score_normalised", 0) > 60:
                 return False, f"rugcheck score {report.get('score_normalised')}"
             for risk in report.get("risks", []) or []:
-                if risk.get("level") == "danger":
-                    return False, f"danger risk: {risk.get('name')}"
+                if risk.get("level") != "danger":
+                    continue
+                name = (risk.get("name") or "")
+                if source == "market" and "authority" in name.lower():
+                    continue  # parsed authorities above are ground truth; RugCheck's
+                    # heuristic flags can contradict them on established tokens
+                return False, f"danger risk: {name}"
             holders = report.get("topHolders", []) or []
             top10 = sum(h.get("pct", 0) for h in holders[:10])
-            if top10 > 30.0:
+            # wrapped/custodial tokens (cbBTC & co.) concentrate holdings at the
+            # issuer by design, so market candidates get a much wider cap
+            holder_cap = 30.0 if source == "meme" else 80.0
+            if top10 > holder_cap:
                 return False, f"top-10 holders own {top10:.1f}%"
-            lp_locked = max(
-                ((m.get("lp") or {}).get("lpLockedPct") or 0) for m in report.get("markets", []) or [{}]
-            )
-            if lp_locked < 90.0:
-                return False, f"LP locked only {lp_locked:.0f}%"
+            if source == "meme":
+                lp_locked = max(
+                    ((m.get("lp") or {}).get("lpLockedPct") or 0) for m in report.get("markets", []) or [{}]
+                )
+                if lp_locked < 90.0:
+                    return False, f"LP locked only {lp_locked:.0f}%"
             return True, "safety_ok"
         except Exception as e:
             return False, f"safety check error: {e}"
+
+    @staticmethod
+    def _authority_live(authority) -> bool:
+        """RugCheck returns an account object, not null/true. An authority
+        owned by the System Program (all 1s) is renounced and harmless."""
+        SYSTEM_PROGRAM = "11111111111111111111111111111111"
+        if not authority:
+            return False
+        if isinstance(authority, dict):
+            return authority.get("owner", SYSTEM_PROGRAM) != SYSTEM_PROGRAM
+        return bool(authority)
 
     # ---- exit ----
     def exit_decision(self, pos: dict, now: float = None) -> Optional[tuple]:

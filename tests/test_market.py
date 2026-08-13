@@ -1,4 +1,6 @@
 """Tests for whole-market discovery (GeckoTerminal) and source-aware gates."""
+import asyncio
+
 from perception import PerceptionLayer, CandidateToken
 from cognition import MemeEngine
 from helpers import make_cfg
@@ -88,3 +90,107 @@ def test_momentum_filters_apply_to_market_candidates_too():
     )
     ok, reason = eng.passes_gate(blowoff, NOW)
     assert not ok and "blow-off" in reason
+
+
+# ---- source-aware safety check ----
+class FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+class FakeHttp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def get(self, url, **kw):
+        return FakeResp(self._payload)
+
+
+def _report(mint_auth=None, freeze_auth=None, score=10, risks=(), top10_pct=5.0, lp_locked=99.0):
+    return {
+        "mintAuthority": mint_auth,
+        "freezeAuthority": freeze_auth,
+        "score_normalised": score,
+        "risks": list(risks),
+        "topHolders": [{"pct": top10_pct} for _ in range(10)],
+        "markets": [{"lp": {"lpLockedPct": lp_locked}}],
+    }
+
+
+RENOUNCED = {"owner": "11111111111111111111111111111111"}  # System Program
+LIVE = {"owner": "SomeWalletOwner111111111111111111111111111"}
+
+
+def test_renounced_authorities_pass_both_sources():
+    # RugCheck returns account objects; owner=System Program means renounced
+    eng = MemeEngine(make_cfg())
+    for src in ("meme", "market"):
+        ok, _ = asyncio.run(eng.safety_check(
+            FakeHttp(_report(mint_auth=RENOUNCED, freeze_auth=RENOUNCED, top10_pct=2.0)), "MINT", src))
+        assert ok
+
+
+def test_safety_meme_rejects_mint_authority():
+    eng = MemeEngine(make_cfg())
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(mint_auth=LIVE)), "MINT", "meme"))
+    assert not ok and "mint authority" in reason
+
+
+def test_safety_market_tolerates_mint_authority():
+    # wrapped tokens (cbBTC/WBTC style) keep mint authority legitimately
+    eng = MemeEngine(make_cfg())
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(mint_auth=LIVE)), "MINT", "market"))
+    assert ok
+
+
+def test_safety_freeze_authority_blocks_both_sources():
+    eng = MemeEngine(make_cfg())
+    for src in ("meme", "market"):
+        ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(freeze_auth=LIVE)), "MINT", src))
+        assert not ok and "freeze" in reason
+
+
+def test_safety_holder_cap_source_aware():
+    eng = MemeEngine(make_cfg())
+    # 45% top-10 concentration: fine for market (cap 80%), rejected for meme (cap 30%)
+    ok, _ = asyncio.run(eng.safety_check(FakeHttp(_report(top10_pct=4.5)), "MINT", "market"))
+    assert ok
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(top10_pct=4.5)), "MINT", "meme"))
+    assert not ok and "top-10" in reason
+
+
+def test_safety_lp_lock_only_enforced_for_memes():
+    eng = MemeEngine(make_cfg())
+    ok, _ = asyncio.run(eng.safety_check(FakeHttp(_report(lp_locked=0.0)), "MINT", "market"))
+    assert ok
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(lp_locked=50.0, top10_pct=2.0)), "MINT", "meme"))
+    assert not ok and "LP locked" in reason
+
+
+def test_safety_rug_score_blocks_memes_only():
+    eng = MemeEngine(make_cfg())
+    ok, _ = asyncio.run(eng.safety_check(FakeHttp(_report(score=80)), "MINT", "market"))
+    assert ok  # market candidates rely on liquidity/age gates + parsed authorities
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(score=80, top10_pct=2.0)), "MINT", "meme"))
+    assert not ok and "rugcheck score" in reason
+
+
+def test_safety_market_ignores_authority_risks_but_not_others():
+    eng = MemeEngine(make_cfg())
+    # RugCheck's heuristic flags can contradict parsed (renounced) authorities
+    ok, _ = asyncio.run(eng.safety_check(FakeHttp(_report(
+        risks=[{"name": "Mint Authority still enabled", "level": "danger"}])), "MINT", "market"))
+    assert ok
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(
+        risks=[{"name": "Creator holds large supply", "level": "danger"}])), "MINT", "market"))
+    assert not ok and "danger risk" in reason
+    # memes still blocked by any danger risk
+    ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(
+        risks=[{"name": "Mint Authority still enabled", "level": "danger"}], top10_pct=2.0)), "MINT", "meme"))
+    assert not ok

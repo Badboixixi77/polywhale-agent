@@ -153,8 +153,9 @@ class PerceptionLayer:
     # ---- whole-market discovery ----
     async def discover_market_candidates(self, limit: int = 30) -> list:
         """Hunt the entire Solana market: top pools by 24h volume (GeckoTerminal).
-        Zero-liquidity pools (synthetic/prediction markets) are skipped as data
-        noise so the candidate budget is spent on tradable pools."""
+        Zero/low-liquidity pools (synthetic markets, fresh stock-token spam)
+        are skipped so the candidate budget is spent on established, tradable
+        pools — the entry gate demands $25k liquidity anyway."""
         candidates, seen = [], set()
         for page in range(1, 9):
             pools = None
@@ -176,7 +177,7 @@ class PerceptionLayer:
                 break  # rate-limited twice: deeper pages have worse volume anyway
             for pool in pools:
                 c = self._pool_to_candidate(pool)
-                if c and c.mint not in seen and c.liquidity_usd >= 1000.0:
+                if c and c.mint not in seen and c.liquidity_usd >= 10000.0:
                     seen.add(c.mint)
                     candidates.append(c)
             if len(candidates) >= limit:
