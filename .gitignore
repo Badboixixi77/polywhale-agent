@@ -11,6 +11,7 @@ __pycache__/
 
 # Bot runtime data (logs, trade ledger, daily reports)
 polywhale.log
+polywhale.launchd.log
 launchd.out.log
 launchd.err.log
 watchdog.out.log
@@ -26,4 +27,3 @@ reports/
 
 # Empty leftovers from the archived Polymarket bot
 build_project.py
-setup.sh
