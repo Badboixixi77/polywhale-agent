@@ -1,0 +1,172 @@
+"""Execution layer: Jupiter swaps.
+
+Paper mode (DRY_RUN=true, the default) simulates fills from live Jupiter
+quotes without signing anything. Live mode builds, signs and sends the
+transaction. A failed swap never books a position.
+"""
+import base64
+import logging
+import struct
+
+import httpx
+
+from config import JUPITER_BASE, SOL_MINT, USDC_MINT
+
+logger = logging.getLogger("PolyWhale.execution")
+
+KNOWN_DECIMALS = {SOL_MINT: 9, USDC_MINT: 6}
+
+
+class ExecutionLayer:
+    def __init__(self, cfg, ledger, http: httpx.AsyncClient):
+        self.cfg = cfg
+        self.ledger = ledger
+        self.http = http
+        self._decimals_cache = dict(KNOWN_DECIMALS)
+
+    @property
+    def mode(self) -> str:
+        return "paper" if self.cfg.dry_run else "live"
+
+    # ---- decimals ----
+    async def get_decimals(self, mint: str) -> int:
+        if mint in self._decimals_cache:
+            return self._decimals_cache[mint]
+        resp = await self.http.post(
+            self.cfg.rpc_url,
+            json={
+                "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+                "params": [mint, {"encoding": "base64"}],
+            },
+        )
+        resp.raise_for_status()
+        data_b64 = resp.json()["result"]["value"]["data"][0]
+        data = base64.b64decode(data_b64)
+        # SPL mint layout: decimals is the byte at offset 44
+        decimals = struct.unpack_from("B", data, 44)[0]
+        self._decimals_cache[mint] = decimals
+        return decimals
+
+    # ---- quote ----
+    async def quote(self, input_mint: str, output_mint: str, amount_raw: int) -> dict:
+        resp = await self.http.get(
+            f"{JUPITER_BASE}/swap/v1/quote",
+            params={
+                "inputMint": input_mint,
+                "outputMint": output_mint,
+                "amount": str(amount_raw),
+                "slippageBps": self.cfg.slippage_bps,
+            },
+        )
+        resp.raise_for_status()
+        quote = resp.json()
+        if "outAmount" not in quote:
+            raise RuntimeError(f"bad quote: {quote}")
+        return quote
+
+    # ---- swaps ----
+    async def buy(self, sleeve: str, input_mint: str, output_mint: str, symbol: str, usd: float) -> dict:
+        """Swap `usd` worth of input_mint for output_mint. Returns fill dict or None."""
+        try:
+            in_dec = await self.get_decimals(input_mint)
+            amount_raw = int(usd * (10 ** in_dec))
+            quote = await self.quote(input_mint, output_mint, amount_raw)
+            out_dec = await self.get_decimals(output_mint)
+            out_amount = int(quote["outAmount"]) / (10 ** out_dec)
+            if out_amount <= 0:
+                return None
+            fill_price = usd / out_amount
+
+            if self.cfg.dry_run:
+                fill = {"mode": "paper", "usd": usd, "amount": out_amount, "price": fill_price}
+            else:
+                tx_ok = await self._send_swap(quote)
+                if not tx_ok:
+                    return None
+                fill = {"mode": "live", "usd": usd, "amount": out_amount, "price": fill_price}
+
+            self.ledger.record_fill(sleeve, output_mint, "buy", usd, out_amount, fill_price, fill["mode"])
+            logger.info(f"[{fill['mode']}] BUY ${usd:.2f} {symbol}: {out_amount:.8g} @ ${fill_price:.8g}")
+            return fill
+        except Exception as e:
+            logger.error(f"buy failed ({sleeve}/{symbol}): {e}")
+            return None
+
+    async def sell(self, sleeve: str, mint: str, symbol: str, amount: float, ref_sol_price: float) -> dict:
+        """Sell token amount back to SOL. ref_sol_price converts proceeds to USD.
+        Returns fill dict (with usd + price) or None."""
+        try:
+            dec = await self.get_decimals(mint)
+            amount_raw = int(amount * (10 ** dec))
+            quote = await self.quote(mint, SOL_MINT, amount_raw)
+            sol_out = int(quote["outAmount"]) / 1e9
+            if sol_out <= 0 or ref_sol_price <= 0:
+                return None
+            usd_out = sol_out * ref_sol_price
+            fill_price = usd_out / amount
+
+            if self.cfg.dry_run:
+                fill = {"mode": "paper", "usd": usd_out, "amount": amount, "price": fill_price}
+            else:
+                tx_ok = await self._send_swap(quote)
+                if not tx_ok:
+                    return None
+                fill = {"mode": "live", "usd": usd_out, "amount": amount, "price": fill_price}
+
+            self.ledger.record_fill(sleeve, mint, "sell", usd_out, amount, fill_price, fill["mode"], f"sol_out={sol_out:.6f}")
+            logger.info(f"[{fill['mode']}] SELL {amount:.8g} {symbol} -> {sol_out:.6f} SOL (~${usd_out:.3f})")
+            return fill
+        except Exception as e:
+            logger.error(f"sell failed ({sleeve}/{symbol}): {e}")
+            return None
+
+    # ---- live signing/sending ----
+    async def _send_swap(self, quote: dict) -> bool:
+        """Build, sign and send the swap transaction. Returns True only when confirmed."""
+        try:
+            # Lazy imports so paper mode runs without on-chain deps installed.
+            from solders.keypair import Keypair
+            from solders.message import to_bytes_versioned
+            from solders.transaction import VersionedTransaction
+            from solana.rpc.async_api import AsyncClient
+            from solana.rpc.types import TxOpts
+
+            if not self.cfg.wallet_private_key:
+                logger.error("live mode requires WALLET_PRIVATE_KEY in .env")
+                return False
+
+            keypair = Keypair.from_base58_string(self.cfg.wallet_private_key)
+            resp = await self.http.post(
+                f"{JUPITER_BASE}/swap/v1/swap",
+                json={
+                    "quoteResponse": quote,
+                    "userPublicKey": str(keypair.pubkey()),
+                    "wrapAndUnwrapSol": True,
+                    "prioritizationFeeLamports": {
+                        "priorityLevelWithMaxLamports": {
+                            "maxLamports": self.cfg.max_priority_fee_lamports,
+                            "priorityLevel": "high",
+                        }
+                    },
+                },
+            )
+            resp.raise_for_status()
+            tx_bytes = base64.b64decode(resp.json()["swapTransaction"])
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            signature = keypair.sign_message(to_bytes_versioned(tx.message))
+            signed_tx = VersionedTransaction.populate(tx.message, [signature])
+
+            async with AsyncClient(self.cfg.rpc_url) as client:
+                send_resp = await client.send_raw_transaction(
+                    bytes(signed_tx), opts=TxOpts(skip_preflight=False, max_retries=3)
+                )
+                sig = send_resp.value
+                if sig is None:
+                    logger.error(f"swap send failed: {send_resp}")
+                    return False
+                await client.confirm_transaction(sig, commitment="confirmed")
+            logger.info(f"swap confirmed: {sig}")
+            return True
+        except Exception as e:
+            logger.error(f"live swap failed: {e}")
+            return False

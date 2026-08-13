@@ -1,0 +1,24 @@
+# Secrets — NEVER commit
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Bot runtime data (logs, trade ledger, daily reports)
+polywhale.log
+polywhale_ledger.db
+polywhale_ledger.db-wal
+polywhale_ledger.db-shm
+reports/
+
+# Editor / OS
+.DS_Store
+.qoder/
+
+# Empty leftovers from the archived Polymarket bot
+build_project.py
+setup.sh
