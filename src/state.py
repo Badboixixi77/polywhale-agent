@@ -54,6 +54,10 @@ class Ledger:
                     key TEXT PRIMARY KEY,
                     value TEXT
                 );
+                CREATE TABLE IF NOT EXISTS equity_history (
+                    ts REAL NOT NULL,
+                    equity REAL NOT NULL
+                );
             """)
 
     # ---- meta ----
@@ -111,6 +115,13 @@ class Ledger:
     def open_positions(self):
         with self._lock:
             rows = self.conn.execute("SELECT * FROM positions WHERE status='open'").fetchall()
+        return [dict(r) for r in rows]
+
+    def closed_positions(self):
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM positions WHERE status='closed' ORDER BY closed_at"
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def position_count(self, sleeve) -> int:
@@ -185,3 +196,15 @@ class Ledger:
 
     def close(self):
         self.conn.close()
+
+    # ---- equity history (metrics / dashboard) ----
+    def record_equity(self, ts: float, equity: float):
+        with self._lock, self.conn:
+            self.conn.execute("INSERT INTO equity_history (ts, equity) VALUES (?,?)", (ts, equity))
+
+    def equity_history(self, limit: int = 5000):
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT ts, equity FROM equity_history ORDER BY ts DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [(r["ts"], r["equity"]) for r in reversed(rows)]

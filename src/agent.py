@@ -19,6 +19,8 @@ from risk import RiskEngine
 from execution import ExecutionLayer
 from notify import Notifier
 from report import Reporter
+from metrics import MetricsEngine
+from commands import CommandHandler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +30,8 @@ logging.basicConfig(
 logger = logging.getLogger("PolyWhale")
 
 MEME_SCAN_EVERY = 5  # cycles
+DASHBOARD_EVERY = 15  # cycles (~15 min)
+RECONCILE_EVERY = 60  # cycles (~hourly on-chain balance check in live mode)
 PRICE_JUMP_LIMIT = 3.0  # reject price marks moving >3x per cycle (bad data guard)
 
 
@@ -42,10 +46,13 @@ class PolyWhaleAgent:
         self.memes = MemeEngine(self.cfg)
         self.notifier = Notifier(self.perception.http, self.cfg.telegram_bot_token, self.cfg.telegram_chat_id)
         self.reporter = Reporter(self.cfg, self.ledger)
+        self.metrics = MetricsEngine(self.cfg, self.ledger)
+        self.commands = CommandHandler(self.perception.http, self.cfg, self, self.notifier, self.ledger)
         self.cycle = 0
         self._last_day = None
         self._was_halted = False
         self._was_killed = False
+        self._last_status = None
 
     # ---- accounting ----
     def equity(self) -> float:
@@ -145,6 +152,50 @@ class PolyWhaleAgent:
             await self.notifier.send(f"MEME ENTRY: {c.symbol} ${self.cfg.meme_trade_cap_usd:.2f} (score {self.memes.score(c):.2f})")
             return  # one new entry per scan keeps exposure growth slow
 
+    # ---- operator commands (Telegram) ----
+    def _status(self) -> dict:
+        return self._last_status or self.risk.watchdog_tick(self.equity())
+
+    def ops_status(self) -> str:
+        s = self._status()
+        flags = (" HALTED" if s["halted"] else "") + (" KILLED" if s["killed"] else "")
+        halt = "ENGAGED" if self.risk.manual_halt_active() else "off"
+        lines = [
+            f"PolyWhale status | mode={'PAPER' if self.cfg.dry_run else 'LIVE'}{flags}",
+            f"Equity: ${s['equity']:.2f} | Day PnL: ${s['daily_pnl']:+.2f} | Drawdown: {s['drawdown']:.1%}",
+            f"Manual halt: {halt}",
+        ]
+        positions = self.ledger.open_positions()
+        lines.append(f"Open positions ({len(positions)}):")
+        if not positions:
+            lines.append("- none")
+        for p in positions:
+            value = p["amount"] * p["current_price"]
+            ret = (p["current_price"] / p["entry_price"] - 1) if p["entry_price"] > 0 else 0.0
+            lines.append(f"- [{p['sleeve']}] {p['symbol']}: ${value:.2f} ({ret:+.1%})")
+        return "\n".join(lines)
+
+    def ops_halt(self) -> str:
+        self.risk.set_manual_halt(True)
+        return "Manual halt ENGAGED — no new entries until /resume. Open positions still follow exit rules."
+
+    def ops_resume(self) -> str:
+        self.risk.set_manual_halt(False)
+        return "Manual halt cleared — trading resumed."
+
+    def ops_reset_kill(self) -> str:
+        self.risk.reset_kill_switch()
+        return "Kill switch reset — trading re-enabled. Review what caused it before scaling up."
+
+    def ops_report(self) -> str:
+        summary = self.reporter.build_summary(self._status())
+        path = self.reporter.write_report(summary)
+        return f"Report written to {path}"
+
+    def ops_metrics(self) -> str:
+        self.metrics.write_dashboard()
+        return self.metrics.render_text()
+
     async def _watch_events(self, status: dict):
         """Alert on guardrail transitions and emit the daily report at UTC rollover."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -176,9 +227,25 @@ class PolyWhaleAgent:
         )
         await self.bootstrap()
 
+        if self.commands.enabled:
+            asyncio.create_task(self.commands.run())
+
         while True:
             self.cycle += 1
+            self.ledger.set_meta("last_heartbeat", time.time())
             try:
+                if not self.cfg.dry_run and (self.cycle == 1 or self.cycle % RECONCILE_EVERY == 0):
+                    try:
+                        ok, notes = await self.execution.reconcile()
+                        if not ok:
+                            await self.notifier.send(
+                                "RECONCILE DRIFT: on-chain balances below ledger — entries halted. "
+                                + " | ".join(notes)
+                            )
+                            self.risk.set_manual_halt(True)
+                    except Exception as e:
+                        logger.error(f"reconcile error: {e}")
+
                 sol_price = await self.perception.sol_price()
                 if sol_price > 0:
                     self.ledger.append_price(time.time(), sol_price)
@@ -190,6 +257,10 @@ class PolyWhaleAgent:
                     await self.meme_tick()
 
                 status = self.risk.watchdog_tick(self.equity())
+                self._last_status = status
+                self.ledger.record_equity(time.time(), status["equity"])
+                if self.cycle % DASHBOARD_EVERY == 0:
+                    self.metrics.write_dashboard()
                 await self._watch_events(status)
                 n_open = len(self.ledger.open_positions())
                 flags = (" HALTED" if status["halted"] else "") + (" KILLED" if status["killed"] else "")

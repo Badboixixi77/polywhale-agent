@@ -22,7 +22,7 @@ Perception  ->  Cognition  ->  Risk  ->  Execution
 3. **Risk** (`src/risk.py`) — the cage. Every order must be approved here. It enforces per-trade caps, position limits, sleeve budgets, a daily-loss halt, and a portfolio drawdown kill switch.
 4. **Execution** (`src/execution.py`) — routes swaps through the Jupiter aggregator. In **paper mode** (default) it simulates fills from live quotes without touching your wallet; in live mode it signs and sends real transactions.
 
-Everything the bot knows — positions, fills, guardrail state — persists in a local SQLite ledger (`src/state.py`), so restarts are safe. Alerts and daily reports are handled by `src/notify.py` and `src/report.py`.
+Everything the bot knows — positions, fills, guardrail state — persists in a local SQLite ledger (`src/state.py`), so restarts are safe. Alerts, daily reports, performance metrics, and Telegram commands are handled by `src/notify.py`, `src/report.py`, `src/metrics.py`, and `src/commands.py`.
 
 ### The risk cage at a glance
 
@@ -56,8 +56,11 @@ polywhale-agent/
 │   ├── state.py        # SQLite ledger (positions, fills, guardrails)
 │   ├── config.py       # Typed configuration from .env
 │   ├── notify.py       # Telegram alerts (log-only if unconfigured)
-│   └── report.py       # Daily summary reports (reports/<date>.md)
+│   ├── report.py       # Daily summary reports (reports/<date>.md)
+│   ├── metrics.py      # Win rate / profit factor / HTML dashboard
+│   └── commands.py     # Telegram command channel (/status, /halt, ...)
 ├── tests/              # Pytest suite (risk cage + strategy logic)
+├── ops/                # launchd service for auto-restart
 ├── legacy/             # Archived Polymarket bot (v1)
 ├── .env.example        # Template — copy to .env and fill in
 ├── .gitignore          # Keeps secrets and runtime data out of git
@@ -125,6 +128,36 @@ TELEGRAM_CHAT_ID=<your chat id>
 
 If these are empty, all alerts still appear in `polywhale.log` prefixed with `ALERT:`.
 
+### Telegram commands
+
+With Telegram configured, the channel is two-way. Send these to your bot (only your chat ID is authorized):
+
+| Command | Effect |
+|---|---|
+| `/status` | Equity, day PnL, guardrail flags, open positions |
+| `/halt` | Pause all new entries (manual halt) |
+| `/resume` | Clear the manual halt |
+| `/reset_kill` | Reset the drawdown kill switch |
+| `/report` | Write today's report and return its path |
+| `/metrics` | Win rate, profit factor, max drawdown |
+| `/help` | Command list |
+
+---
+
+## Monitoring
+
+- **Daily reports** — written to `reports/<date>.md` at each UTC midnight rollover (or on demand via `/report`).
+- **Dashboard** — `reports/dashboard.html` is refreshed automatically every ~15 minutes and via `/metrics`. Open it in any browser: equity curve, win rate, profit factor, max drawdown. No server, no JS dependencies.
+- **Heartbeat dead-man's switch** — the agent stamps a heartbeat into the ledger every cycle. A separate watchdog process (`src/watchdog.py`) checks it every minute and alerts via Telegram if it goes stale >3 min (frozen/hung bot) — including a recovery message when the bot comes back. Being a separate process is the point: a frozen bot cannot silence its own executioner.
+- **On-chain reconciliation** — in live mode the bot compares real wallet balances (native SOL + SPL token accounts) against the ledger on startup and hourly. Any shortfall beyond 1% tolerance triggers an alert and halts new entries until reviewed.
+- **Auto-restart (macOS)** — install the bot **and its watchdog** as launchd services so crashes and reboots never silently kill either:
+
+```bash
+bash ops/install_service.sh
+```
+
+Stop them again with `launchctl bootout gui/$(id -u)/com.polywhale.agent` (same for `com.polywhale.watchdog`).
+
 ---
 
 ## Going live (eventually)
@@ -149,5 +182,4 @@ A free [Helius](https://helius.dev) RPC key in `RPC_URL` is recommended if the p
 
 - Solana only (Base chain support deferred).
 - Paper-mode fills assume quote prices; real swaps may get slightly worse fills.
-- No Telegram *commands* yet (alerts are one-way).
 - Strategy is deliberately simple; this project values discipline over cleverness.

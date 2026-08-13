@@ -1,5 +1,6 @@
 # Secrets — NEVER commit
 .env
+wallet_backup.txt
 
 # Python
 venv/
@@ -10,6 +11,10 @@ __pycache__/
 
 # Bot runtime data (logs, trade ledger, daily reports)
 polywhale.log
+launchd.out.log
+launchd.err.log
+watchdog.out.log
+watchdog.err.log
 polywhale_ledger.db
 polywhale_ledger.db-wal
 polywhale_ledger.db-shm

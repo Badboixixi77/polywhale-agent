@@ -15,6 +15,20 @@ from config import JUPITER_BASE, SOL_MINT, USDC_MINT
 logger = logging.getLogger("PolyWhale.execution")
 
 KNOWN_DECIMALS = {SOL_MINT: 9, USDC_MINT: 6}
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+RECONCILE_TOLERANCE = 0.01  # 1% slack for fee dust
+
+
+def find_drift(expected: list, actual: dict, tolerance: float = RECONCILE_TOLERANCE) -> list:
+    """Compare ledger expectations [(symbol, key, amount)] against on-chain
+    balances. Shortfalls are hazards and get reported; excess on-chain is
+    informational only (dust, tips) and ignored."""
+    drift = []
+    for symbol, key, amount in expected:
+        have = actual.get(key, 0.0)
+        if have < amount * (1 - tolerance):
+            drift.append(f"{symbol}: ledger {amount:.6g}, on-chain {have:.6g}")
+    return drift
 
 
 class ExecutionLayer:
@@ -170,3 +184,40 @@ class ExecutionLayer:
         except Exception as e:
             logger.error(f"live swap failed: {e}")
             return False
+
+    # ---- on-chain reconciliation ----
+    async def wallet_balances(self) -> dict:
+        """Actual on-chain balances: {'SOL': x, <mint>: amount}. Live mode only."""
+        from solders.keypair import Keypair
+        from solders.pubkey import Pubkey
+        from solana.rpc.async_api import AsyncClient
+        from solana.rpc.types import TokenAccountOpts
+
+        kp = Keypair.from_base58_string(self.cfg.wallet_private_key)
+        balances = {}
+        async with AsyncClient(self.cfg.rpc_url) as client:
+            sol = await client.get_balance(kp.pubkey())
+            balances["SOL"] = sol.value / 1e9
+            opts = TokenAccountOpts(program_id=Pubkey.from_string(TOKEN_PROGRAM_ID))
+            resp = await client.get_token_accounts_by_owner_json_parsed(kp.pubkey(), opts)
+            for item in resp.value:
+                info = item.account.data.parsed["info"]
+                balances[info["mint"]] = float(info["tokenAmount"]["uiAmountString"])
+        return balances
+
+    async def reconcile(self) -> tuple:
+        """Verify on-chain balances cover ledger expectations. Returns (ok, notes)."""
+        if self.cfg.dry_run:
+            logger.info("reconcile: paper mode, on-chain check skipped")
+            return True, []
+        actual = await self.wallet_balances()
+        expected = [
+            (p["symbol"], "SOL" if p["mint"] == SOL_MINT else p["mint"], p["amount"])
+            for p in self.ledger.open_positions()
+        ]
+        notes = find_drift(expected, actual)
+        if notes:
+            logger.critical(f"RECONCILE DRIFT: {notes}")
+            return False, notes
+        logger.info("reconcile: on-chain balances match ledger")
+        return True, []

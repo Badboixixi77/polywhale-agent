@@ -26,6 +26,14 @@ class RiskEngine:
         until = self.ledger.get_meta("daily_halt_until", "0")
         return time.time() < float(until)
 
+    # ---- manual halt (operator command) ----
+    def manual_halt_active(self) -> bool:
+        return self.ledger.get_meta("manual_halt", "0") == "1"
+
+    def set_manual_halt(self, on: bool):
+        self.ledger.set_meta("manual_halt", "1" if on else "0")
+        logger.warning(f"Manual halt {'ENGAGED' if on else 'cleared'} by operator command")
+
     # ---- per-order approval ----
     def approve_entry(self, sleeve: str, usd: float) -> tuple:
         """Returns (approved, reason). The cage fails closed."""
@@ -33,6 +41,8 @@ class RiskEngine:
             return False, "kill switch active"
         if self.daily_halt_active():
             return False, "daily loss halt active"
+        if self.manual_halt_active():
+            return False, "manual halt active"
         if usd <= 0:
             return False, "non-positive size"
 
