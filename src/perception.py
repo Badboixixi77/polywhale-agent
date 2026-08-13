@@ -185,6 +185,42 @@ class PerceptionLayer:
             await asyncio.sleep(2.0)  # pace GeckoTerminal's rate limit
         return candidates[:limit]
 
+    async def discover_trending_candidates(self, limit: int = 15) -> list:
+        """Hunt actively-traded tape: pools ranked by 24h transaction count.
+        This is where real meme momentum lives (the volume leaderboard is
+        often flooded with synthetic stock pools). Lower liquidity floor —
+        the satellite sleeve's judgment engine decides what's worth risking."""
+        candidates, seen = [], set()
+        for page in range(1, 4):
+            pools = None
+            for attempt in (1, 2):
+                try:
+                    resp = await self.http.get(
+                        f"{GECKOTERMINAL_BASE}/networks/solana/pools",
+                        params={"page": page, "sort": "h24_tx_count_desc"},
+                        headers={"Accept": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    pools = resp.json().get("data", [])
+                    break
+                except Exception as e:
+                    logger.warning(f"trending discovery page {page} attempt {attempt} failed: {e}")
+                    if attempt == 1:
+                        await asyncio.sleep(5.0)
+            if pools is None:
+                break
+            for pool in pools:
+                c = self._pool_to_candidate(pool)
+                if c is not None:
+                    c.source = "trending"
+                if c and c.mint not in seen and c.liquidity_usd >= 5000.0:
+                    seen.add(c.mint)
+                    candidates.append(c)
+            if len(candidates) >= limit:
+                break
+            await asyncio.sleep(2.0)  # pace GeckoTerminal's rate limit
+        return candidates[:limit]
+
     def _pool_to_candidate(self, pool: dict):
         """Parse one GeckoTerminal pool into a CandidateToken. None if unusable."""
         try:

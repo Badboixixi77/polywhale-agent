@@ -136,6 +136,85 @@ class MemeEngine:
         except Exception as e:
             return False, f"safety check error: {e}"
 
+    async def safety_flags(self, http: httpx.AsyncClient, mint: str) -> tuple:
+        """RugCheck as raw evidence instead of a pass/fail gate, for the
+        judgment engine. Returns (veto, danger_flags, top10_pct, lp_locked).
+        Veto = certain loss (honeypot/blacklist/live authority) — those are
+        not risks worth analyzing. Errors fail closed as vetoes."""
+        try:
+            resp = await http.get(f"{RUGCHECK_BASE}/v1/tokens/{mint}/report")
+            resp.raise_for_status()
+            report = resp.json()
+            veto, flags = None, []
+            if self._authority_live(report.get("mintAuthority")):
+                veto = "mint authority active"
+            elif self._authority_live(report.get("freezeAuthority")):
+                veto = "freeze authority active"
+            for risk in report.get("risks", []) or []:
+                if risk.get("level") != "danger":
+                    continue
+                name = (risk.get("name") or "")
+                low = name.lower()
+                if any(k in low for k in ("honeypot", "blacklist", "cannot be sold")):
+                    veto = veto or name  # unsellable token = certain loss, never a risk
+                elif "authority" in low:
+                    continue  # parsed authorities above are ground truth
+                else:
+                    flags.append(name)
+            holders = report.get("topHolders", []) or []
+            top10 = sum(h.get("pct", 0) for h in holders[:10])
+            lp_locked = max(
+                ((m.get("lp") or {}).get("lpLockedPct") or 0)
+                for m in report.get("markets", []) or [{}]
+            )
+            return veto, flags, top10, lp_locked
+        except Exception as e:
+            return f"safety check error: {e}", [], 0.0, 0.0
+
+    def risk_judgment(self, c: CandidateToken, flags: list, top10_pct: float,
+                      lp_locked_pct: float) -> tuple:
+        """Senior-trader judgment: is this risk worth taking?
+        Reward = momentum + turnover + liquidity quality; discounted by soft
+        danger flags and concentration. Score >= threshold → TAKE, and the
+        entry fires without hesitation — the cage (daily halt, slice cap)
+        already bounds the loss, so fear has no role after the verdict.
+        Flat tape always passes: momentum == 0 means nothing to catch."""
+        score, why = 0.0, []
+        h6 = max(c.price_change_h6, 0.0)
+        h1 = max(c.price_change_h1, 0.0)
+        if h6 <= 0 and h1 <= 0:
+            return "PASS", 0.0, "flat tape: no momentum"
+        momentum = min(h6, 30.0) / 30.0 * 40.0 + min(h1, 15.0) / 15.0 * 20.0
+        score += momentum
+        why.append(f"momentum +{momentum:.0f}")
+        turnover = min(c.volume_h24 / c.liquidity_usd, 10.0) if c.liquidity_usd > 0 else 0.0
+        t_pts = turnover / 10.0 * 25.0
+        if t_pts > 0:
+            score += t_pts
+            why.append(f"turnover +{t_pts:.0f}")
+        if c.liquidity_usd >= 50000:
+            liq_pts = 15
+        elif c.liquidity_usd >= 20000:
+            liq_pts = 10
+        else:
+            liq_pts = 5
+        score += liq_pts
+        why.append(f"liquidity +{liq_pts}")
+        for f in flags:
+            score -= 15.0
+            why.append(f"[{f}] -15")
+        if top10_pct > 80.0:
+            score -= 30.0
+            why.append(f"holders {top10_pct:.0f}% -30")
+        elif top10_pct > 60.0:
+            score -= 10.0
+            why.append(f"holders {top10_pct:.0f}% -10")
+        if lp_locked_pct < 50.0:
+            score -= 15.0
+            why.append(f"LP locked {lp_locked_pct:.0f}% -15")
+        verdict = "TAKE" if score >= self.cfg.satellite_take_threshold else "PASS"
+        return verdict, round(score, 1), " ".join(why)
+
     @staticmethod
     def _authority_live(authority) -> bool:
         """RugCheck returns an account object, not null/true. An authority

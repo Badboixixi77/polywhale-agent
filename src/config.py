@@ -64,6 +64,7 @@ class Config:
     satellite_trail_pct: float = 0.25     # trail from peak once in profit
     satellite_stop_pct: float = -0.60     # wide stop; the slice is the risk unit
     satellite_min_liquidity_usd: float = 10000.0
+    satellite_take_threshold: float = 35.0  # judgment score needed to fire a TAKE
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -102,4 +103,5 @@ class Config:
             satellite_trail_pct=float(os.getenv("SATELLITE_TRAIL_PCT", "0.25")),
             satellite_stop_pct=float(os.getenv("SATELLITE_STOP_PCT", "-0.60")),
             satellite_min_liquidity_usd=float(os.getenv("SATELLITE_MIN_LIQUIDITY_USD", "10000")),
+            satellite_take_threshold=float(os.getenv("SATELLITE_TAKE_THRESHOLD", "35")),
         )

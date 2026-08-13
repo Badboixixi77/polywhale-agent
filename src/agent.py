@@ -155,7 +155,10 @@ class PolyWhaleAgent:
         if self.cfg.discovery in ("market", "both"):
             candidates += await self.perception.discover_market_candidates(limit=30)
         entered = await self._meme_entry(candidates, held)
-        await self._satellite_entry(candidates, held | {entered} if entered else held)
+        # satellite also hunts actively-traded tape (tx-count leaderboard),
+        # where real meme momentum lives
+        sat_pool = candidates + await self.perception.discover_trending_candidates(limit=15)
+        await self._satellite_entry(sat_pool, held | {entered} if entered else held)
 
     async def _meme_entry(self, candidates: list, held: set):
         """Disciplined sleeve: strict gates, fixed $2 size. Returns entered mint."""
@@ -208,10 +211,16 @@ class PolyWhaleAgent:
         gated.sort(key=self.memes.score, reverse=True)
 
         for c in gated[:3]:
-            # risk-tolerant source keeps honeypot checks, drops meme paranoia
-            ok, reason = await self.memes.safety_check(self.perception.http, c.mint, "market")
-            if not ok:
-                logger.info(f"satellite safety reject {c.symbol}: {reason}")
+            # judgment engine: evidence → verdict → fire. Certain losses
+            # (honeypot/authority) are vetoed; real risks are scored, and a
+            # TAKE enters the full slice without hesitation.
+            veto, flags, top10, lp_locked = await self.memes.safety_flags(self.perception.http, c.mint)
+            if veto:
+                logger.info(f"satellite veto {c.symbol}: {veto} (certain loss, not a risk)")
+                continue
+            verdict, jscore, breakdown = self.memes.risk_judgment(c, flags, top10, lp_locked)
+            logger.info(f"satellite judgment {c.symbol}: {verdict} {jscore} ({breakdown})")
+            if verdict != "TAKE":
                 continue
             approved, reason = self.risk.approve_entry("satellite", capital)
             if not approved:
@@ -221,8 +230,9 @@ class PolyWhaleAgent:
             if fill is None:
                 continue
             self.ledger.open_or_add_position("satellite", c.mint, c.symbol, fill["usd"], fill["amount"], fill["price"])
-            logger.info(f"SATELLITE entry: {c.symbol} ${fill['usd']:.2f} score={self.memes.score(c):.2f}")
-            await self.notifier.send(f"SATELLITE ENTRY: {c.symbol} ${fill['usd']:.2f} (score {self.memes.score(c):.2f})")
+            logger.info(f"SATELLITE entry: {c.symbol} ${fill['usd']:.2f} judgment={jscore}")
+            await self.notifier.send(
+                f"🎯 RISK TAKEN: {c.symbol} ${fill['usd']:.2f} | verdict TAKE (score {jscore})\n{breakdown}")
             return
 
     # ---- operator commands (Telegram) ----

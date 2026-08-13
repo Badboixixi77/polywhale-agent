@@ -1,6 +1,8 @@
 """Tests for whole-market discovery (GeckoTerminal) and source-aware gates."""
 import asyncio
 
+import pytest
+
 from perception import PerceptionLayer, CandidateToken
 from cognition import MemeEngine
 from helpers import make_cfg
@@ -215,3 +217,75 @@ def test_safety_market_ignores_authority_risks_but_not_others():
     ok, reason = asyncio.run(eng.safety_check(FakeHttp(_report(
         risks=[{"name": "Mint Authority still enabled", "level": "danger"}], top10_pct=2.0)), "MINT", "meme"))
     assert not ok
+
+
+# ---- judgment engine (satellite risk analysis) ----
+
+class ErrHttp:
+    async def get(self, url, **kw):
+        raise RuntimeError("boom")
+
+
+def test_safety_flags_vetoes_certain_losses():
+    eng = MemeEngine(make_cfg())
+    veto, *_ = asyncio.run(eng.safety_flags(FakeHttp(_report(mint_auth=LIVE)), "MINT"))
+    assert veto == "mint authority active"
+    veto, *_ = asyncio.run(eng.safety_flags(FakeHttp(_report(freeze_auth=LIVE)), "MINT"))
+    assert veto == "freeze authority active"
+    veto, *_ = asyncio.run(eng.safety_flags(FakeHttp(_report(
+        risks=[{"name": "Honeypot token", "level": "danger"}])), "MINT"))
+    assert veto == "Honeypot token"
+
+
+def test_safety_flags_collects_soft_risks_without_veto():
+    eng = MemeEngine(make_cfg())
+    veto, flags, top10, lp = asyncio.run(eng.safety_flags(FakeHttp(_report(
+        risks=[{"name": "Large Amount of LP Unlocked", "level": "danger"}],
+        top10_pct=4.0, lp_locked=20.0)), "MINT"))
+    assert veto is None
+    assert flags == ["Large Amount of LP Unlocked"]
+    assert top10 == pytest.approx(40.0)
+    assert lp == 20.0
+
+
+def test_safety_flags_error_fails_closed():
+    eng = MemeEngine(make_cfg())
+    veto, flags, _, _ = asyncio.run(eng.safety_flags(ErrHttp(), "MINT"))
+    assert veto and "error" in veto and flags == []
+
+
+def test_judgment_takes_real_momentum():
+    eng = MemeEngine(make_cfg(satellite_take_threshold=35.0))
+    c = make_candidate(price_change_h6=12.0, price_change_h1=4.0, liquidity=30000.0)
+    verdict, score, why = eng.risk_judgment(c, [], 20.0, 99.0)
+    assert verdict == "TAKE" and score >= 35.0
+    assert "momentum" in why
+
+
+def test_judgment_passes_flat_tape():
+    eng = MemeEngine(make_cfg(satellite_take_threshold=35.0))
+    c = make_candidate(price_change_h6=-2.0, price_change_h1=0.0)
+    verdict, score, why = eng.risk_judgment(c, [], 5.0, 99.0)
+    assert verdict == "PASS" and score == 0.0 and "flat tape" in why
+
+
+def test_judgment_weak_mover_fails_with_soft_flags():
+    eng = MemeEngine(make_cfg(satellite_take_threshold=35.0))
+    c = make_candidate(price_change_h6=3.0, price_change_h1=1.0, liquidity=5000.0)
+    verdict, _, _ = eng.risk_judgment(c, ["Large Amount of LP Unlocked"], 5.0, 20.0)
+    assert verdict == "PASS"  # momentum 4 + turnover 25 + liq 5 - 15 - 15 < 35
+
+
+def test_judgment_strong_mover_survives_lp_flag():
+    # the risk-taker deal: a genuine mover accepts soft risks the old gate banned
+    eng = MemeEngine(make_cfg(satellite_take_threshold=35.0))
+    c = make_candidate(price_change_h6=25.0, price_change_h1=8.0, liquidity=60000.0)
+    verdict, score, _ = eng.risk_judgment(c, ["Large Amount of LP Unlocked"], 20.0, 30.0)
+    assert verdict == "TAKE" and score >= 35.0
+
+
+def test_judgment_penalizes_whale_concentration():
+    eng = MemeEngine(make_cfg(satellite_take_threshold=35.0))
+    c = make_candidate(price_change_h6=8.0, price_change_h1=2.0, liquidity=12000.0)
+    verdict, _, _ = eng.risk_judgment(c, [], 85.0, 99.0)
+    assert verdict == "PASS"  # -30 for 85% holder concentration kills a mediocre mover
