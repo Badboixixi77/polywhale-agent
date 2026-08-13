@@ -47,12 +47,36 @@ class MetricsEngine:
                 max_dd = max(max_dd, (peak - eq) / peak)
         return max_dd
 
+    def sleeve_stats(self) -> dict:
+        """Per-sleeve attribution: which machine earns, which one bleeds."""
+        by_sleeve = {}
+        for p in self.ledger.closed_positions():
+            by_sleeve.setdefault(p["sleeve"], []).append(p["realized_pnl"])
+        out = {}
+        for sleeve, pnls in sorted(by_sleeve.items()):
+            wins = [x for x in pnls if x > 0]
+            losses = [x for x in pnls if x <= 0]
+            wr = len(wins) / len(pnls)
+            avg_win = sum(wins) / len(wins) if wins else 0.0
+            avg_loss = sum(losses) / len(losses) if losses else 0.0
+            out[sleeve] = {
+                "trades": len(pnls),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": wr,
+                "pnl": sum(pnls),
+                "avg_win": avg_win,
+                "avg_loss": avg_loss,
+                "expectancy": wr * avg_win + (1 - wr) * avg_loss,
+            }
+        return out
+
     # ---- rendering ----
     def render_text(self, stats: dict = None) -> str:
         s = stats or self.compute()
         wr = f"{s['win_rate']:.0%}" if s["win_rate"] is not None else "n/a"
         pf = f"{s['profit_factor']:.2f}" if s["profit_factor"] is not None else "n/a"
-        return (
+        base = (
             f"PolyWhale metrics | mode={'PAPER' if self.cfg.dry_run else 'LIVE'}\n"
             f"Closed trades: {s['closed_trades']} (W {s['wins']} / L {s['losses']})\n"
             f"Win rate: {wr} | Profit factor: {pf}\n"
@@ -60,6 +84,14 @@ class MetricsEngine:
             f"Realized PnL: ${s['realized_pnl']:+.2f} | Open positions: {s['open_positions']}\n"
             f"Max drawdown: {s['max_drawdown']:.1%}"
         )
+        sleeves = self.sleeve_stats()
+        for name, st in sleeves.items():
+            base += (
+                f"\n[{name}] {st['trades']} trades (W {st['wins']}/L {st['losses']}) "
+                f"wr {st['win_rate']:.0%} | PnL ${st['pnl']:+.2f} | "
+                f"expectancy ${st['expectancy']:+.3f}/trade"
+            )
+        return base
 
     def render_html(self, stats: dict = None, max_points: int = 600) -> str:
         s = stats or self.compute()
@@ -87,6 +119,20 @@ class MetricsEngine:
             f'<div class="card"><div class="label">{k}</div><div class="value">{v}</div></div>'
             for k, v in cards
         )
+        rows_html = "".join(
+            f"<tr><td>{name}</td><td>{st['trades']}</td>"
+            f"<td>{st['wins']}/{st['losses']}</td><td>{st['win_rate']:.0%}</td>"
+            f"<td>${st['pnl']:+.2f}</td><td>${st['expectancy']:+.3f}</td></tr>"
+            for name, st in self.sleeve_stats().items()
+        )
+        sleeves_panel = (
+            f"<div class='panel' style='margin-top:16px'>"
+            f"<div class='label' style='margin-bottom:8px'>Sleeve attribution</div>"
+            f"<table style='color:#e6edf3;font-size:13px;border-collapse:collapse;width:100%'>"
+            f"<tr style='color:#8b949e'><th align='left'>Sleeve</th><th>Trades</th><th>W/L</th>"
+            f"<th>Win rate</th><th>PnL</th><th>Expectancy</th></tr>{rows_html}</table></div>"
+            if rows_html else ""
+        )
         return (
             "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<title>PolyWhale Dashboard</title><style>"
@@ -102,6 +148,7 @@ class MetricsEngine:
             f"<div class='sub'>Generated {now} | equity samples: {s['equity_points']}</div>"
             f"<div class='grid'>{cards_html}</div>"
             f"<div class='panel'><div class='label' style='margin-bottom:8px'>Equity curve</div>{svg}</div>"
+            f"{sleeves_panel}"
             "</body></html>"
         )
 
