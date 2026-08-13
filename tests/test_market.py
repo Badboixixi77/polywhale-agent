@@ -29,7 +29,8 @@ def make_candidate(source="market", liquidity=100000.0, age_ms=OLD_MS, **kw):
     return CandidateToken(
         mint=kw.get("mint", "MINTABC"), symbol="TOKEN", price_usd=0.125,
         liquidity_usd=liquidity, volume_h24=500000.0, pair_created_ms=age_ms,
-        price_change_h1=1.0, price_change_h6=5.0, source=source,
+        price_change_h1=kw.get("price_change_h1", 1.0),
+        price_change_h6=kw.get("price_change_h6", 5.0), source=source,
     )
 
 
@@ -66,6 +67,26 @@ def test_market_gate_uses_market_thresholds():
     assert not ok and "liquidity" in reason
     ok, reason = eng.passes_gate(make_candidate("market", age_ms=int((NOW - 30 * 3600) * 1000)), NOW)
     assert not ok and "age" in reason  # 30h old fails the 48h market gate
+
+
+def test_market_gate_requires_momentum():
+    """Backtested dead-tape filter: flat market candidates don't enter."""
+    eng = MemeEngine(make_cfg(market_min_h6_pct=2.0))
+    ok, reason = eng.passes_gate(make_candidate("market", price_change_h6=0.5), NOW)
+    assert not ok and "dead tape" in reason
+    ok, reason = eng.passes_gate(make_candidate("market", price_change_h6=-3.0), NOW)
+    assert not ok and "dead tape" in reason
+    ok, _ = eng.passes_gate(make_candidate("market", price_change_h6=2.5), NOW)
+    assert ok
+    # disabled at 0
+    eng0 = MemeEngine(make_cfg(market_min_h6_pct=0.0))
+    ok, _ = eng0.passes_gate(make_candidate("market", price_change_h6=-1.0), NOW)
+    assert ok
+    # meme source is exempt (trending feed already implies momentum)
+    ok, reason = eng.passes_gate(make_candidate("meme", price_change_h6=0.0,
+                                                liquidity=6000.0,
+                                                age_ms=int((NOW - 30 * 3600) * 1000)), NOW)
+    assert ok
 
 
 def test_meme_gate_unchanged():

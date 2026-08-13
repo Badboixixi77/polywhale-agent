@@ -18,7 +18,10 @@ def bars_from(prices, step=3600, vol=5_000_000.0, start_ts=START):
 
 
 def meme_cfg(**kw):
-    base = dict(min_market_liquidity_usd=1000.0, min_market_age_hours=1.0)
+    # market_min_h6_pct=0 keeps synthetic scenarios gate-neutral; the
+    # momentum-floor experiments use the engine's own min_h6_pct knob
+    base = dict(min_market_liquidity_usd=1000.0, min_market_age_hours=1.0,
+                market_min_h6_pct=0.0)
     base.update(kw)
     return make_cfg(**base)
 
@@ -66,6 +69,22 @@ def test_low_liquidity_produces_no_trades():
     stats = engine.run(bars_from(prices), 10.0, OLD_MS)  # $10 liq < $1k floor
     assert stats["n_trades"] == 0
     assert stats["max_drawdown"] == 0.0
+
+
+def test_momentum_floor_filters_dead_tape_entries():
+    # flat tape: entries happen with no floor, vanish with a +2% h6 floor
+    prices = [1.0] * 30 + [1.0, 1.01, 0.99, 1.0]  # h6 never reaches +2%
+    bars = bars_from(prices)
+    baseline = BacktestEngine(meme_cfg(), mode="meme").run(bars, 50000.0, OLD_MS)
+    floored = BacktestEngine(meme_cfg(), mode="meme", min_h6_pct=2.0).run(
+        bars, 50000.0, OLD_MS)
+    assert baseline["n_trades"] >= 1
+    assert floored["n_trades"] == 0
+    # but a genuine ramp passes the floor and still trades
+    ramp = [1.0] * 30 + [1.05, 1.12, 1.2, 1.3]
+    ramped = BacktestEngine(meme_cfg(), mode="meme", min_h6_pct=2.0).run(
+        bars_from(ramp), 50000.0, OLD_MS)
+    assert ramped["n_trades"] >= 1
 
 
 # ---- satellite-mode mechanics ----

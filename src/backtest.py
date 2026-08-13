@@ -42,11 +42,13 @@ class BacktestEngine:
     mode='satellite' uses the ride-winner rules — both straight from
     MemeEngine, no reimplementation."""
 
-    def __init__(self, cfg, mode: str = "meme", cost_pct: float = 0.015, size_usd: float = None):
+    def __init__(self, cfg, mode: str = "meme", cost_pct: float = 0.015, size_usd: float = None,
+                 min_h6_pct: float = None):
         self.cfg = cfg
         self.mode = mode
         self.cost_pct = cost_pct
         self.size_usd = size_usd or cfg.meme_trade_cap_usd
+        self.min_h6_pct = min_h6_pct  # experiment knob: momentum floor, None = off
         self.memes = MemeEngine(cfg)
 
     # ---- data ----
@@ -121,6 +123,10 @@ class BacktestEngine:
 
             if pos is None:
                 cand = self._candidate_from_bars(bars, i, liquidity_usd, created_ms, source)
+                if cand is not None:
+                    # experiment knob: momentum floor applied before the real gate
+                    if self.min_h6_pct is not None and cand.price_change_h6 < self.min_h6_pct:
+                        cand = None
                 if cand is not None:
                     gate = (self.memes.satellite_gate(cand, ts) if self.mode == "satellite"
                             else self.memes.passes_gate(cand, ts))

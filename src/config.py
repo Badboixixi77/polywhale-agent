@@ -56,6 +56,7 @@ class Config:
     discovery: str = "market"
     min_market_liquidity_usd: float = 25000.0
     min_market_age_hours: float = 48.0
+    market_min_h6_pct: float = 2.0  # backtested dead-tape filter (0 disables)
     meme_scan_every_cycles: int = 3
     # satellite sleeve: one high-momentum coin, full compounding, wide leash
     satellite_enabled: bool = True
@@ -94,6 +95,7 @@ class Config:
             discovery=os.getenv("DISCOVERY", "market").lower(),
             min_market_liquidity_usd=float(os.getenv("MIN_MARKET_LIQUIDITY_USD", "25000")),
             min_market_age_hours=float(os.getenv("MIN_MARKET_AGE_HOURS", "48")),
+            market_min_h6_pct=float(os.getenv("MARKET_MIN_H6_PCT", "2")),
             meme_scan_every_cycles=int(os.getenv("MEME_SCAN_EVERY_CYCLES", "3")),
             satellite_enabled=os.getenv("SATELLITE_ENABLED", "true").lower() == "true",
             satellite_budget_usd=float(os.getenv("SATELLITE_BUDGET_USD", "5")),

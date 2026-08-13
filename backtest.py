@@ -90,11 +90,14 @@ async def main():
     ap.add_argument("--aggregate", type=int, default=1)
     ap.add_argument("--bars", type=int, default=720)
     ap.add_argument("--cost", type=float, default=0.015, help="round-trip cost haircut")
+    ap.add_argument("--min-h6", type=float, default=None,
+                    help="experiment: require h6 momentum >= this %% before entry")
     args = ap.parse_args()
 
     cfg = Config.from_env()
     async with httpx.AsyncClient(timeout=30.0) as http:
-        engine = BacktestEngine(cfg, mode=args.mode, cost_pct=args.cost)
+        engine = BacktestEngine(cfg, mode=args.mode, cost_pct=args.cost,
+                                min_h6_pct=args.min_h6)
         pools = []
         if args.pool:
             pools = [{"id": args.pool, "address": args.pool.split("_", 1)[-1],

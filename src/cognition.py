@@ -67,6 +67,11 @@ class MemeEngine:
         Market-sourced candidates face market-tuned thresholds."""
         if c.source == "market":
             min_liq, min_age = self.cfg.min_market_liquidity_usd, self.cfg.min_market_age_hours
+            # Backtested 2026-08: entries on flat tape (cbBTC 0/10, BONK 0/17)
+            # bleed to max_hold. Require real h6 momentum for market picks.
+            # 0 (or negative) disables the floor.
+            if self.cfg.market_min_h6_pct > 0 and c.price_change_h6 < self.cfg.market_min_h6_pct:
+                return False, f"dead tape: h6 {c.price_change_h6:+.1f}% < +{self.cfg.market_min_h6_pct:.0f}%"
         else:
             min_liq, min_age = self.cfg.min_token_liquidity_usd, self.cfg.min_token_age_hours
         if c.liquidity_usd < min_liq:
