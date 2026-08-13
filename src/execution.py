@@ -94,7 +94,6 @@ class ExecutionLayer:
         """Swap `usd` worth of input_mint for output_mint. Returns fill dict or None."""
         try:
             in_dec = await self.get_decimals(input_mint)
-            amount_raw = int(usd * (10 ** in_dec))
             if input_mint == output_mint:
                 # no swap needed (e.g. majors DCA accumulating SOL from SOL):
                 # book the purchase directly at the current market price
@@ -107,6 +106,16 @@ class ExecutionLayer:
                 self.ledger.record_fill(sleeve, output_mint, "buy", usd, out_amount, price, mode)
                 logger.info(f"[{mode}] BUY ${usd:.2f} {symbol}: {out_amount:.8g} @ ${price:.8g} (same-asset)")
                 return fill
+            # Dollars -> input-token units: stablecoins are ~1:1, but SOL must
+            # be sized by spot price ($6 of SOL is 0.079 SOL, not 6 SOL).
+            if input_mint == SOL_MINT:
+                sol_price = await self._sol_usd_price()
+                if sol_price <= 0:
+                    return None
+                in_amount = usd / sol_price
+            else:
+                in_amount = usd
+            amount_raw = int(in_amount * (10 ** in_dec))
             quote = await self.quote(input_mint, output_mint, amount_raw)
             out_dec = await self.get_decimals(output_mint)
             out_amount = int(quote["outAmount"]) / (10 ** out_dec)
@@ -166,7 +175,11 @@ class ExecutionLayer:
             from solders.message import to_bytes_versioned
             from solders.transaction import VersionedTransaction
             from solana.rpc.async_api import AsyncClient
-            from solana.rpc.types import TxOpts
+            from solana.rpc.commitment import Confirmed
+            try:
+                from solana.rpc.types import TxOpts
+            except ImportError:  # solana.py >= 0.36 moved TxOpts to models
+                from solana.rpc.models import TxOpts
 
             if not self.cfg.wallet_private_key:
                 logger.error("live mode requires WALLET_PRIVATE_KEY in .env")
@@ -190,10 +203,23 @@ class ExecutionLayer:
             resp.raise_for_status()
             tx_bytes = base64.b64decode(resp.json()["swapTransaction"])
             tx = VersionedTransaction.from_bytes(tx_bytes)
-            signature = keypair.sign_message(to_bytes_versioned(tx.message))
-            signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
             async with AsyncClient(self.cfg.rpc_url) as client:
+                # Jupiter's embedded blockhash often expires before preflight
+                # (BlockhashNotFound); rebuild the message with a fresh one.
+                from solders.message import MessageV0
+
+                bh_resp = await client.get_latest_blockhash()
+                fresh_hash = bh_resp.value.blockhash
+                msg = MessageV0(
+                    tx.message.header,
+                    tx.message.account_keys,
+                    fresh_hash,
+                    tx.message.instructions,
+                    tx.message.address_table_lookups,
+                )
+                signature = keypair.sign_message(to_bytes_versioned(msg))
+                signed_tx = VersionedTransaction.populate(msg, [signature])
                 send_resp = await client.send_raw_transaction(
                     bytes(signed_tx), opts=TxOpts(skip_preflight=False, max_retries=3)
                 )
@@ -201,7 +227,7 @@ class ExecutionLayer:
                 if sig is None:
                     logger.error(f"swap send failed: {send_resp}")
                     return False
-                await client.confirm_transaction(sig, commitment="confirmed")
+                await client.confirm_transaction(sig, commitment=Confirmed)
             logger.info(f"swap confirmed: {sig}")
             return True
         except Exception as e:
