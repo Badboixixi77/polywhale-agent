@@ -154,41 +154,12 @@ class PolyWhaleAgent:
             candidates += await self.perception.discover_candidates(limit=15)
         if self.cfg.discovery in ("market", "both"):
             candidates += await self.perception.discover_market_candidates(limit=30)
-        entered = await self._meme_entry(candidates, held)
-        # satellite also hunts actively-traded tape (tx-count leaderboard),
-        # where real meme momentum lives
+        # Old momentum meme sleeve is RETIRED (owner decision): all new entries
+        # flow through the judgment-gated satellite sleeve only. Any legacy
+        # meme positions still open are managed out by the monitor loop
+        # (trailing/stops/TP) until they close naturally.
         sat_pool = candidates + await self.perception.discover_trending_candidates(limit=15)
-        await self._satellite_entry(sat_pool, held | {entered} if entered else held)
-
-    async def _meme_entry(self, candidates: list, held: set):
-        """Disciplined sleeve: strict gates, fixed $2 size. Returns entered mint."""
-        gated = []
-        for c in candidates:
-            ok, reason = self.memes.passes_gate(c)
-            if ok and c.mint not in held:
-                gated.append(c)
-            elif not ok:
-                logger.debug(f"gate reject {c.symbol}: {reason}")
-        gated.sort(key=self.memes.score, reverse=True)
-
-        for c in gated[:3]:
-            ok, reason = await self.memes.safety_check(self.perception.http, c.mint, c.source)
-            if not ok:
-                logger.info(f"safety reject {c.symbol}: {reason}")
-                continue
-            approved, reason = self.risk.approve_entry("meme", self.cfg.meme_trade_cap_usd)
-            if not approved:
-                logger.info(f"Meme entry blocked: {reason}")
-                return None
-            fill = await self.execution.buy("meme", SOL_MINT, c.mint, c.symbol, self.cfg.meme_trade_cap_usd)
-            if fill is None:
-                continue
-            self.ledger.open_or_add_position("meme", c.mint, c.symbol, fill["usd"], fill["amount"], fill["price"])
-            tag = "MARKET" if c.source == "market" else "MEME"
-            logger.info(f"{tag} entry: {c.symbol} score={self.memes.score(c):.2f}")
-            await self.notifier.send(f"{tag} ENTRY: {c.symbol} ${self.cfg.meme_trade_cap_usd:.2f} (score {self.memes.score(c):.2f})")
-            return c.mint  # one new entry per scan keeps exposure growth slow
-        return None
+        await self._satellite_entry(sat_pool, held)
 
     async def _satellite_entry(self, candidates: list, held: set):
         """Aggression sleeve: one coin, whole slice, loose gate. The slice
